@@ -7,9 +7,33 @@
 #import <mach/mach_time.h>
 #import <spawn.h>
 #import <Metal/Metal.h>
+#import <IOKit/IOKitLib.h>
 
 @implementation CoreAILoaderResult
 @end
+
+static NSString *getSystemANEArchitecture(void) {
+    CFMutableDictionaryRef matching = IOServiceMatching("H11ANEIn");
+    io_service_t service = IOServiceGetMatchingService(kIOMainPortDefault, matching);
+    if (!service) {
+        matching = IOServiceMatching("AppleH16ANEInterface");
+        service = IOServiceGetMatchingService(kIOMainPortDefault, matching);
+    }
+    NSString *archStr = nil;
+    if (service) {
+        CFMutableDictionaryRef props = NULL;
+        if (IORegistryEntryCreateCFProperties(service, &props, kCFAllocatorDefault, 0) == KERN_SUCCESS && props) {
+            NSDictionary *dict = (__bridge NSDictionary *)props;
+            NSDictionary *devProps = dict[@"DeviceProperties"];
+            if (devProps && devProps[@"ANEDevicePropertyTypeANEArchitectureTypeStr"]) {
+                archStr = [devProps[@"ANEDevicePropertyTypeANEArchitectureTypeStr"] copy];
+            }
+            CFRelease(props);
+        }
+        IOObjectRelease(service);
+    }
+    return archStr ?: @"h13g";
+}
 
 // Inspect tensor dimensions directly using MPSGraphExecutable
 static BOOL inspectModelTensorsViaMPSGraph(NSString *mlirbPath, uint64_t *outInBytes, uint64_t *outOutBytes) {
@@ -362,11 +386,27 @@ BOOL load_coreai_for_aneclient(const char *modelPath, void **outResult) {
                 return NO;
             }
 
+            NSString *targetArch = nil;
+            NSString *plistPath = [bundleDir stringByAppendingPathComponent:[NSString stringWithFormat:@"compiler_options_%@.plist", regionKey]];
+            NSDictionary *compilerOptsDict = [NSDictionary dictionaryWithContentsOfFile:plistPath];
+            if (compilerOptsDict && compilerOptsDict.count > 0) {
+                NSString *firstKey = compilerOptsDict.allKeys.firstObject;
+                NSDictionary *archDict = compilerOptsDict[firstKey];
+                if ([archDict isKindOfClass:[NSDictionary class]] && archDict[@"TargetArchitecture"]) {
+                    targetArch = archDict[@"TargetArchitecture"];
+                } else {
+                    targetArch = firstKey;
+                }
+            }
+            if (!targetArch) {
+                targetArch = getSystemANEArchitecture();
+            }
+
             NSDictionary *loadOpts = @{
                 @"kANEFModelType": @"kANEFModelANECIR",
                 @"kANEFCompilerOptionsFilenameKey": [NSString stringWithFormat:@"compiler_options_%@.plist", regionKey],
                 @"kANEFNetPlistFilenameKey": [NSString stringWithFormat:@"%@.bc.mlir", regionKey],
-                @"kANEFTargetArchitectureKey": @"h16s",
+                @"kANEFTargetArchitectureKey": targetArch,
                 @"kANEFPerformanceStatsMask": @(15)
             };
 
