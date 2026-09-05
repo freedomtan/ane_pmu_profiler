@@ -60,7 +60,7 @@ static BOOL inspectModelTensorsViaMPSGraph(NSString *mlirbPath, uint64_t *outInB
     return YES;
 }
 
-// Extract the deterministic ANERegionsHash from manifest.plist in O(1)
+// Extract the deterministic ANERegionsHash from manifest.plist
 static NSString *extractANERegionHashFromManifest(NSString *manifestPath) {
     NSDictionary *manifest = [NSDictionary dictionaryWithContentsOfFile:manifestPath];
     if (!manifest) return nil;

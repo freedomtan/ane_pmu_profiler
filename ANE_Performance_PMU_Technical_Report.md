@@ -21,7 +21,7 @@ Historically, this hardware PMU telemetry has been locked down by kernel driver 
 
 On Apple Silicon (e.g., Apple H16g / M4), the ANE subsystem comprises:
 - **16 Physical Cores**: Operating at dynamic DVFS clock frequencies up to $\approx 2.42\text{ GHz}$.
-- **Neural Engine (NE) Matrix Core**: Wide systolic Multiply-Accumulate (MAC) array specialized for dense tensor contractions and 2D/3D convolutions.
+- **Neural Engine (NE) Convolution Core**: Wide convolution Multiply-Accumulate (MAC) engine specialized for dense tensor operations and 2D/3D convolutions.
 - **Planar Engine (PE / L2PE)**: Wide vector execution ALU handling non-linear activations (ReLU, GeLU), element-wise tensor additions, pooling, and quantization scalers.
 - **On-Chip L2 SRAM**: High-bandwidth local scratchpad SRAM acting as an activation cache and weight buffer.
 - **Unified Memory DMA Controller**: Direct Memory Access channels streaming tensors between unified system RAM (LPDDR5X) and on-chip SRAM.
@@ -32,7 +32,7 @@ On Apple Silicon (e.g., Apple H16g / M4), the ANE subsystem comprises:
        |                                                             |
        |  +------------------+             +----------------------+  |
        |  |  NE Tensor Core  |<----------->|    On-Chip L2 SRAM   |  |
-       |  |  (Systolic MACs) |             |     (Weight/Act)     |  |
+       |  |(Convolution MACs)|             |     (Weight/Act)     |  |
        |  +------------------+             +----------------------+  |
        |           |                                  ^              |
        |           v                                  |              |
@@ -436,7 +436,7 @@ Measured Silicon Latency      | 1.399 ms (714.9 FPS)   | 0.601 ms (1,663.5 FPS) 
 
 ### 5.2 Microarchitectural Analysis & Insights
 
-#### A. The Depthwise Systolic Array Bottleneck
+#### A. The Depthwise Convolution Engine Bottleneck
 A major paradox revealed by the PMU data is that while MobileNetV2 requires **$13.7\times$ fewer theoretical operations** than ResNet-50 ($300\text{M}$ vs $4.12\text{B}$ MACs), its tensor engine execution (`kANE_NE_COMPUTE_CYCLES`) takes **nearly the same number of cycles** ($2.98\text{M}$ vs $3.62\text{M}$).
 - **ResNet-50 Sustained Efficiency**:
   $$\frac{4.12 \times 10^9\text{ MACs}}{3.62 \times 10^6\text{ cycles}} \approx \mathbf{1{,}138\text{ MACs / cycle}}$$
@@ -460,7 +460,7 @@ hw.ne_control_config.ane_ne_config.r.ConvCfg.f.SIy
 hw.ne_control_config.ane_ne_config.r.MACCfg.f.ChannelsPerEngine
 hw.ne_control_config.ane_ne_config.r.MACCfg.f.InputDepth
 ```
-The ANE matrix core’s systolic array (`MACCfg`) is wired with fixed cross-channel multipliers (`ChannelsPerEngine`). In standard convolutions (ResNet-50), the input depth channels ($C_{\text{in}} \ge 64$) fill the systolic multiplier lanes entirely. In depthwise convolutions (MobileNetV2), each filter operates strictly on $1$ input channel ($C_{\text{in}} = 1, \text{Groups} = C$). Because the systolic array cannot coalesce separate depthwise channels across its physical vector lanes without inter-core communication overhead, $90\%+$ of the multiplier lanes are forced to execute bubble/zero operations, wasting compute cycles.
+The ANE convolution engine (`MACCfg`) is wired with fixed cross-channel multipliers (`ChannelsPerEngine`). In standard convolutions (ResNet-50), the input depth channels ($C_{\text{in}} \ge 64$) fill the convolution engine multiplier lanes entirely. In depthwise convolutions (MobileNetV2), each filter operates strictly on $1$ input channel ($C_{\text{in}} = 1, \text{Groups} = C$). Because the convolution engine cannot coalesce separate depthwise channels across its physical vector lanes without inter-core communication overhead, $90\%+$ of the multiplier lanes are forced to execute bubble/zero operations, wasting compute cycles.
 
 ---
 
@@ -497,10 +497,10 @@ Load command 1
 The profiling suite implemented in this repository provides a high-performance, native Objective-C and C toolchain backed by private system frameworks:
 
 ### 6.1 Architecture of Native Modules
-- [`dump_ane_pmu.m`](file:///Users/freedom/work/ios-hacking/ane_pmu_profiler/dump_ane_pmu.m): Full 29-register hardware PMU profiler. Dispatches live inference directly into physical ANE silicon and decodes hardware counters (systolic MAC cycles, Planar Engine cycles, unified DMA bandwidth, pipeline stall cycles).
+- [`dump_ane_pmu.m`](file:///Users/freedom/work/ios-hacking/ane_pmu_profiler/dump_ane_pmu.m): Full 29-register hardware PMU profiler. Dispatches live inference directly into physical ANE silicon and decodes hardware counters (convolution engine MAC cycles, Planar Engine cycles, unified DMA bandwidth, pipeline stall cycles).
 - [`coreai_loader.m`](file:///Users/freedom/work/ios-hacking/ane_pmu_profiler/coreai_loader.m): High-performance Objective-C model loader:
-  - **Zero-Latency In-Process Compilation**: If the target model has not been specialized yet, it invokes `compile_model_for_host()` directly in-process without spawning shell subprocesses.
-  - **$O(1)$ Direct Region Hash Resolution**: Extracts `ANERegionsHash` directly from `manifest.plist` in $O(1)$ time, completely bypassing slow SHA-256 weight file hashing and filesystem crawling.
+  - **In-Process Compilation**: If the target model has not been specialized yet, it invokes `compile_model_for_host()` directly in-process without spawning shell subprocesses.
+  - **Direct Region Hash Resolution**: Extracts `ANERegionsHash` directly from `manifest.plist` to locate and load the cached `.hwx` binary directly into `_ANEClient`.
   - **Direct Pre-Compiled Silicon Binding**: Loads directly from `/Library/Caches/com.apple.aned/.../<hash1>/<hash2>/model.hwx` into `_ANEClient` via `+[_ANEModel modelAtURL:key:]` in $1.29\text{ ms}$.
 - [`model_compiler.m`](file:///Users/freedom/work/ios-hacking/ane_pmu_profiler/model_compiler.m) & [`model_compiler.h`](file:///Users/freedom/work/ios-hacking/ane_pmu_profiler/model_compiler.h): Standalone Objective-C CLI tool and C API for Host-Specialized JIT compilation (`targetSOC: "this"`).
 - [`model_compiler_bridge.swift`](file:///Users/freedom/work/ios-hacking/ane_pmu_profiler/model_compiler_bridge.swift): Ultra-compact (38-line, 10 KB object code) bridge exposing a pure C ABI (`@_cdecl("compile_model_for_host")`) that configures `CompilationDelegates.mpsGraph` and calls `CoreAICompiler.Compiler.compileSync()`.
@@ -528,7 +528,7 @@ make dump_ane_pmu_objc
 # 1. Specialize MLIR bytecode for host ANE silicon (targetSOC: "this")
 ./model_compiler_objc resnet50_fp16.aimodel/main.mlirb output_host_jit
 
-# 2. Standalone CoreAI model validation & tensor inspection (O(1) loading in 1.29 ms)
+# 2. Standalone CoreAI model validation & tensor inspection
 ./coreai_loader resnet50_fp16.aimodel
 
 # 3. Live silicon PMU telemetry benchmark with 29-register hardware streaming
@@ -541,7 +541,7 @@ make dump_ane_pmu_objc
 
 Based on direct silicon PMU telemetry and disassembled driver behaviors:
 
-1. **Avoid Over-Relying on FLOP Counts**: FLOP and MAC counts from PyTorch or ONNX do not predict ANE runtime. As proven by the PMU counters, MobileNetV2 has $13.7\times$ fewer FLOPs but spends nearly the same cycles on the systolic array ($2.98\text{M}$ vs $3.62\text{M}$) due to depthwise multiplier underutilization (`hw.ne_control_config.ane_ne_config.r.MACCfg.f.OpMode`).
+1. **Avoid Over-Relying on FLOP Counts**: FLOP and MAC counts from PyTorch or ONNX do not predict ANE runtime. As proven by the PMU counters, MobileNetV2 has $13.7\times$ fewer FLOPs but spends nearly the same cycles on the convolution engine ($2.98\text{M}$ vs $3.62\text{M}$) due to depthwise multiplier underutilization (`hw.ne_control_config.ane_ne_config.r.MACCfg.f.OpMode`).
 2. **Minimize Planar Engine (Vector) Operations**: Large activation layers and element-wise additions incur significant L2PE cycles (`kANE_L2PE_COMPUTE_CYCLES`). Structuring networks with linear bottlenecks and fused activations preserves throughput.
 3. **Control Tensor Dimensions for L2 SRAM Fit**: Keep intermediate feature map tiles within on-chip L2 SRAM to eliminate output pipeline stalls (`kANE_NE_OUTPUT_STALL_CYCLES`), which accounted for over $2.26\text{M}$ stall cycles in ResNet-50.
 4. **Leverage Weight Pinning**: The ANE architecture caches static weights across inferences. Optimizations should prioritize activation streaming bandwidth (`kANE_DMA_READ_BYTES`) rather than re-optimizing weight storage.
