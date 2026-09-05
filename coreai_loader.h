@@ -1,0 +1,86 @@
+//
+// coreai_loader.h
+// Objective-C Declarations for CoreAI, MPSGraph, and AppleNeuralEngine
+//
+
+#ifndef COREAI_LOADER_H
+#define COREAI_LOADER_H
+
+#import <Foundation/Foundation.h>
+#import <MetalPerformanceShadersGraph/MetalPerformanceShadersGraph.h>
+#import "model_compiler.h"
+
+NS_ASSUME_NONNULL_BEGIN
+
+#pragma mark - AppleNeuralEngine Private Declarations
+
+@class _ANEModel;
+
+@interface _ANEModel : NSObject
+@property (nonatomic, assign) unsigned long long programHandle;
+@property (nonatomic, copy, nullable) NSString *cacheURLIdentifier;
+@property (nonatomic, readonly) NSURL *modelURL;
++ (nullable instancetype)modelAtURL:(NSURL *)url key:(NSString *)key;
+@end
+
+@interface _ANEClient : NSObject
++ (instancetype)sharedConnection;
+- (BOOL)compileModel:(_ANEModel *)model
+             options:(NSDictionary *)options
+                 qos:(unsigned int)qos
+               error:(NSError **)error;
+- (BOOL)loadModel:(_ANEModel *)model
+          options:(NSDictionary *)options
+              qos:(unsigned int)qos
+            error:(NSError **)error;
+- (BOOL)unloadModel:(_ANEModel *)model
+            options:(NSDictionary *)options
+                qos:(unsigned int)qos
+              error:(NSError **)error;
+@end
+
+#pragma mark - MetalPerformanceShadersGraph Private Declarations
+
+@interface MPSGraphCompilationDescriptor (PrivateANE)
+@property (readwrite, nonatomic) unsigned long long preferredDevice;
+@end
+
+@interface MPSGraphExecutableDescriptor : NSObject
+@property (readwrite, nonatomic) BOOL isAICodeBytecode;
+@property (readwrite, nonatomic) BOOL includeDebugInfo;
+@property (readwrite, nonatomic) unsigned long long compilerOptions;
+@property (strong, nonatomic, nullable) MPSGraphCompilationDescriptor *compilationDescriptor;
+@end
+
+@interface MPSGraphExecutable (PrivateMLIR)
+- (nullable instancetype)initWithMLIRBytecode:(NSData *)bytecode
+                         executableDescriptor:(MPSGraphExecutableDescriptor *)descriptor;
+- (NSArray<MPSGraphShapedType *> *)getInputShapesForFunction:(NSString *)functionName;
+- (NSArray<MPSGraphShapedType *> *)getOutputShapesForFunction:(NSString *)functionName;
+@end
+
+#pragma mark - Loader Result Interface
+
+@interface CoreAILoaderResult : NSObject
+@property (nonatomic, strong) _ANEClient *client;
+@property (nonatomic, strong) _ANEModel *model;
+@property (nonatomic, assign) uint64_t inBytes;
+@property (nonatomic, assign) uint64_t outBytes;
+@property (nonatomic, copy) NSString *hwxPath;
+@end
+
+#pragma mark - C Function Declarations
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+BOOL load_coreai_for_aneclient(const char *modelPath, void * _Nullable * _Nonnull outResult);
+
+#ifdef __cplusplus
+}
+#endif
+
+NS_ASSUME_NONNULL_END
+
+#endif /* COREAI_LOADER_H */
