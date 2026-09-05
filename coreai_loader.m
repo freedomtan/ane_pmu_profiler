@@ -6,6 +6,7 @@
 #import "coreai_loader.h"
 #import <mach/mach_time.h>
 #import <spawn.h>
+#import <Metal/Metal.h>
 
 @implementation CoreAILoaderResult
 @end
@@ -108,40 +109,122 @@ static NSString *locateCompiledHWXForHash(NSString *regionHash, NSString *modelD
         }
     }
 
-    // 3. Check system /Library/Caches/com.apple.aned
+    // 3. Check system /Library/Caches/com.apple.aned (only if readable)
     NSString *anedBase = @"/Library/Caches/com.apple.aned";
-    if (![fm fileExistsAtPath:anedBase]) {
-        return nil;
-    }
+    if ([fm fileExistsAtPath:anedBase] && access([anedBase UTF8String], R_OK | X_OK) == 0) {
+        NSArray *osBuilds = [fm contentsOfDirectoryAtPath:anedBase error:nil];
+        for (NSString *build in osBuilds) {
+            NSString *assetsCache = [NSString stringWithFormat:@"%@/%@/ModelAssetsCache", anedBase, build];
+            if (![fm fileExistsAtPath:assetsCache]) continue;
 
-    if (access([anedBase UTF8String], R_OK | X_OK) != 0) {
-        fprintf(stderr, "\n⚠️  NOTICE: '%s' is not accessible (requires ROOT permissions).\n", [anedBase UTF8String]);
-        fprintf(stderr, "    On standard macOS, this cache directory is restricted to root (mode 0700).\n");
-        fprintf(stderr, "    Solutions:\n");
-        fprintf(stderr, "      • Run profiler with 'sudo':\n");
-        fprintf(stderr, "          sudo ./dump_ane_pmu_objc %s\n", modelDir ? [modelDir UTF8String] : "resnet50_fp16.aimodel");
-        fprintf(stderr, "      • Or provide a standalone .hwx directly:\n");
-        fprintf(stderr, "          ./dump_ane_pmu_objc --hwx <path/to/model.hwx>\n");
-        fprintf(stderr, "      • Or grant read permission to the cache directory:\n");
-        fprintf(stderr, "          sudo chmod +rx %s\n\n", [anedBase UTF8String]);
-        return nil;
-    }
-
-    // Enumerate OS build subdirectories dynamically (avoiding hardcoded OS build numbers)
-    NSArray *osBuilds = [fm contentsOfDirectoryAtPath:anedBase error:nil];
-    for (NSString *build in osBuilds) {
-        NSString *assetsCache = [NSString stringWithFormat:@"%@/%@/ModelAssetsCache", anedBase, build];
-        if (![fm fileExistsAtPath:assetsCache]) continue;
-
-        NSArray *subdirs = [fm contentsOfDirectoryAtPath:assetsCache error:nil];
-        for (NSString *sub in subdirs) {
-            NSString *candidate = [NSString stringWithFormat:@"%@/%@/%@/%@/model.hwx", assetsCache, sub, hash1, hash2];
-            if ([fm fileExistsAtPath:candidate]) {
-                return candidate;
+            NSArray *subdirs = [fm contentsOfDirectoryAtPath:assetsCache error:nil];
+            for (NSString *sub in subdirs) {
+                NSString *candidate = [NSString stringWithFormat:@"%@/%@/%@/%@/model.hwx", assetsCache, sub, hash1, hash2];
+                if ([fm fileExistsAtPath:candidate]) {
+                    return candidate;
+                }
             }
         }
     }
     return nil;
+}
+
+// Locate or generate user-space ANE bundle (.bc.mlir + compiler_options.plist) for direct unprivileged loading
+static BOOL locateOrPrepareANEBundle(NSString *modelDir, NSString *mlirbFile, NSString *regionHash, NSString **outBundleDir, NSString **outRegionKey) {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSArray *candidates = @[
+        [modelDir stringByAppendingPathComponent:@"output_host_jit/ane_bundle"],
+        [modelDir stringByAppendingPathComponent:@"ane_bundle"]
+    ];
+
+    for (NSString *cand in candidates) {
+        if ([fm fileExistsAtPath:cand]) {
+            NSArray *files = [fm contentsOfDirectoryAtPath:cand error:nil];
+            for (NSString *f in files) {
+                if ([f hasSuffix:@".bc.mlir"]) {
+                    NSString *key = [f substringToIndex:(f.length - @".bc.mlir".length)];
+                    NSString *plistName = [NSString stringWithFormat:@"compiler_options_%@.plist", key];
+                    if ([fm fileExistsAtPath:[cand stringByAppendingPathComponent:plistName]]) {
+                        *outBundleDir = cand;
+                        *outRegionKey = key;
+                        return YES;
+                    }
+                }
+            }
+        }
+    }
+
+    // If not cached, trigger user-space specialization pass via MPSGraphExecutable
+    NSData *bytecode = [NSData dataWithContentsOfFile:mlirbFile];
+    if (!bytecode) return NO;
+
+    id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+    if (!device) return NO;
+    id<MTLCommandQueue> queue = [device newCommandQueue];
+
+    MPSGraphExecutableDescriptor *desc = [[MPSGraphExecutableDescriptor alloc] init];
+    desc.isAICodeBytecode = YES;
+    MPSGraphCompilationDescriptor *compDesc = [[MPSGraphCompilationDescriptor alloc] init];
+    compDesc.preferredDevice = 2; // MPSGraphDeviceTypeANE
+    desc.compilationDescriptor = compDesc;
+
+    MPSGraphExecutable *exec = [[MPSGraphExecutable alloc] initWithMLIRBytecode:bytecode executableDescriptor:desc];
+    if (!exec) return NO;
+
+    NSArray<MPSGraphShapedType *> *inShapes = [exec getInputShapesForFunction:@"main"];
+    NSMutableArray *inputs = [NSMutableArray array];
+    for (MPSGraphShapedType *st in inShapes) {
+        uint64_t count = 1;
+        for (NSNumber *n in st.shape) count *= [n unsignedLongLongValue];
+        unsigned int dt = (unsigned int)st.dataType;
+        uint64_t bpe = (dt == 0x10000020) ? 4 : ((dt == 0x10000008 || dt == 0x20000008) ? 1 : 2);
+        size_t bytes = (size_t)(count * bpe);
+        if (bytes == 0) bytes = 0x1000;
+        id<MTLBuffer> buf = [device newBufferWithLength:bytes options:MTLResourceStorageModeShared];
+        MPSGraphTensorData *td = [[MPSGraphTensorData alloc] initWithMTLBuffer:buf shape:st.shape dataType:st.dataType];
+        [inputs addObject:td];
+    }
+
+    // Run 1 warm-up dispatch to trigger MPSGraph ANE region serialization
+    [exec runAsyncWithMTLCommandQueue:queue inputsArray:inputs resultsArray:nil executionDescriptor:nil];
+
+    // Search for the generated mpsgraph-<pid>-* directory in temporary directory
+    NSString *tmpBase = [NSTemporaryDirectory() stringByAppendingPathComponent:@"com.apple.MetalPerformanceShadersGraph"];
+    NSString *pidPrefix = [NSString stringWithFormat:@"mpsgraph-%d-", getpid()];
+    NSArray *dirs = [fm contentsOfDirectoryAtPath:tmpBase error:nil];
+    NSString *foundTmpDir = nil;
+    for (NSString *d in [dirs reverseObjectEnumerator]) {
+        if ([d hasPrefix:pidPrefix]) {
+            foundTmpDir = [tmpBase stringByAppendingPathComponent:d];
+            break;
+        }
+    }
+
+    if (!foundTmpDir) return NO;
+
+    // Cache the bundle into output_host_jit/ane_bundle
+    NSString *destBundle = [modelDir stringByAppendingPathComponent:@"output_host_jit/ane_bundle"];
+    [fm removeItemAtPath:destBundle error:nil];
+    [fm createDirectoryAtPath:destBundle withIntermediateDirectories:YES attributes:nil error:nil];
+
+    NSArray *tmpFiles = [fm contentsOfDirectoryAtPath:foundTmpDir error:nil];
+    NSString *foundKey = nil;
+    for (NSString *f in tmpFiles) {
+        NSString *src = [foundTmpDir stringByAppendingPathComponent:f];
+        NSString *dst = [destBundle stringByAppendingPathComponent:f];
+        [fm copyItemAtPath:src toPath:dst error:nil];
+        if ([f hasSuffix:@".bc.mlir"]) {
+            foundKey = [f substringToIndex:(f.length - @".bc.mlir".length)];
+        }
+    }
+
+    if (foundKey) {
+        *outBundleDir = destBundle;
+        *outRegionKey = foundKey;
+        return YES;
+    }
+
+    return NO;
 }
 
 BOOL load_coreai_for_aneclient(const char *modelPath, void **outResult) {
@@ -213,49 +296,88 @@ BOOL load_coreai_for_aneclient(const char *modelPath, void **outResult) {
             return NO;
         }
 
-        // 4. Locate compiled .hwx binary (checking local paths and aned cache)
-        NSString *foundHWX = locateCompiledHWXForHash(regionHash, modelDir);
-
-        if (!foundHWX) {
-            fprintf(stderr, "❌ Could not locate compiled model.hwx for region hash: %s\n", [regionHash UTF8String]);
-            return NO;
-        }
-
-        NSDictionary *hwxAttrs = [fm attributesOfItemAtPath:foundHWX error:nil];
-        uint64_t hwxSize = [hwxAttrs[NSFileSize] unsignedLongLongValue];
         if (dtComp > 0) {
             printf("  • Compilation Latency      : %.2f ms\n", (double)dtComp / 1000000.0);
         } else {
             printf("  • Compilation Cache Status : HIT (Zero compilation latency)\n");
         }
-        printf("  • Host JIT Region Hash     : %s\n", [regionHash UTF8String]);
-        printf("  • Compiled Hardware Binary : %s (%llu bytes)\n", [foundHWX UTF8String], hwxSize);
 
-        // 5. Connect to _ANEClient and load model directly
+        // 4. Resolve Model Execution Binary / Bundle:
+        // Priority 1: Standalone .hwx (local or via environment/cache) unless FORCE_USER_SPACE_ANE_BUNDLE is set
+        // Priority 2: Direct User-Space ANE Bundle (unprivileged kANEFModelANECIR)
+        BOOL forceBundle = (getenv("FORCE_USER_SPACE_ANE_BUNDLE") != NULL);
+        NSString *foundHWX = forceBundle ? nil : locateCompiledHWXForHash(regionHash, modelDir);
         _ANEClient *client = [_ANEClient sharedConnection];
         if (!client) {
             fprintf(stderr, "❌ Failed to get _ANEClient sharedConnection\n");
             return NO;
         }
 
-        NSURL *hwxURL = [NSURL fileURLWithPath:foundHWX];
-        _ANEModel *model = [_ANEModel modelAtURL:hwxURL key:@"net"];
-        if (!model) {
-            fprintf(stderr, "❌ Failed to create _ANEModel\n");
-            return NO;
-        }
+        _ANEModel *model = nil;
+        NSString *activeBundlePath = nil;
 
-        NSError *loadErr = nil;
-        NSDictionary *loadOpts = @{
-            @"kANEFModelType": @"kANEFModelPreCompiled",
-            @"kANEFPerformanceStatsMask": @(15)
-        };
+        if (foundHWX) {
+            NSDictionary *hwxAttrs = [fm attributesOfItemAtPath:foundHWX error:nil];
+            uint64_t hwxSize = [hwxAttrs[NSFileSize] unsignedLongLongValue];
+            printf("  • Execution Mode           : Pre-Compiled Hardware Binary (.hwx)\n");
+            printf("  • Host JIT Region Hash     : %s\n", [regionHash UTF8String]);
+            printf("  • Compiled Hardware Binary : %s (%llu bytes)\n", [foundHWX UTF8String], hwxSize);
 
-        BOOL loadOk = [client loadModel:model options:loadOpts qos:25 error:&loadErr];
-        if (!loadOk) {
-            fprintf(stderr, "❌ Failed to load model into ANE silicon: %s\n",
-                    loadErr ? [[loadErr localizedDescription] UTF8String] : "Unknown error");
-            return NO;
+            NSURL *hwxURL = [NSURL fileURLWithPath:foundHWX];
+            model = [_ANEModel modelAtURL:hwxURL key:@"net"];
+            if (!model) {
+                fprintf(stderr, "❌ Failed to create _ANEModel for .hwx\n");
+                return NO;
+            }
+
+            NSError *loadErr = nil;
+            NSDictionary *loadOpts = @{
+                @"kANEFModelType": @"kANEFModelPreCompiled",
+                @"kANEFPerformanceStatsMask": @(15)
+            };
+
+            BOOL loadOk = [client loadModel:model options:loadOpts qos:25 error:&loadErr];
+            if (!loadOk) {
+                fprintf(stderr, "❌ Failed to load model into ANE silicon: %s\n",
+                        loadErr ? [[loadErr localizedDescription] UTF8String] : "Unknown error");
+                return NO;
+            }
+        } else {
+            NSString *bundleDir = nil;
+            NSString *regionKey = nil;
+            if (!locateOrPrepareANEBundle(modelDir, mlirbFile, regionHash, &bundleDir, &regionKey)) {
+                fprintf(stderr, "❌ Failed to prepare user-space ANE bundle for direct loading\n");
+                return NO;
+            }
+
+            printf("  • Execution Mode           : Direct Unprivileged User-Space ANE Bundle (kANEFModelANECIR)\n");
+            printf("  • User-Space ANE Bundle    : %s\n", [bundleDir UTF8String]);
+            printf("  • Region Key               : %s\n", [regionKey UTF8String]);
+            printf("  • Host JIT Region Hash     : %s\n", [regionHash UTF8String]);
+
+            NSURL *bundleURL = [NSURL fileURLWithPath:bundleDir];
+            model = [_ANEModel modelAtURL:bundleURL key:regionKey mpsConstants:regionHash];
+            if (!model) {
+                fprintf(stderr, "❌ Failed to create _ANEModel for bundle\n");
+                return NO;
+            }
+
+            NSDictionary *loadOpts = @{
+                @"kANEFModelType": @"kANEFModelANECIR",
+                @"kANEFCompilerOptionsFilenameKey": [NSString stringWithFormat:@"compiler_options_%@.plist", regionKey],
+                @"kANEFNetPlistFilenameKey": [NSString stringWithFormat:@"%@.bc.mlir", regionKey],
+                @"kANEFTargetArchitectureKey": @"h16s",
+                @"kANEFPerformanceStatsMask": @(15)
+            };
+
+            NSError *loadErr = nil;
+            BOOL loadOk = [client loadModel:model options:loadOpts qos:25 error:&loadErr];
+            if (!loadOk) {
+                fprintf(stderr, "❌ Failed to load ANECIR model into ANE silicon: %s\n",
+                        loadErr ? [[loadErr localizedDescription] UTF8String] : "Unknown error");
+                return NO;
+            }
+            activeBundlePath = bundleDir;
         }
 
         CoreAILoaderResult *result = [[CoreAILoaderResult alloc] init];
@@ -264,6 +386,7 @@ BOOL load_coreai_for_aneclient(const char *modelPath, void **outResult) {
         result.inBytes = detectedInBytes;
         result.outBytes = detectedOutBytes;
         result.hwxPath = foundHWX;
+        result.bundlePath = activeBundlePath;
 
         *outResult = (__bridge_retained void *)result;
         return YES;

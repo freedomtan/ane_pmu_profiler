@@ -21,6 +21,7 @@ NS_ASSUME_NONNULL_BEGIN
 @property (nonatomic, copy, nullable) NSString *cacheURLIdentifier;
 @property (nonatomic, readonly) NSURL *modelURL;
 + (nullable instancetype)modelAtURL:(NSURL *)url key:(NSString *)key;
++ (nullable instancetype)modelAtURL:(NSURL *)url key:(NSString *)key mpsConstants:(nullable NSString *)mpsConstants;
 @end
 
 @interface _ANEClient : NSObject
@@ -66,7 +67,8 @@ NS_ASSUME_NONNULL_BEGIN
 @property (nonatomic, strong) _ANEModel *model;
 @property (nonatomic, assign) uint64_t inBytes;
 @property (nonatomic, assign) uint64_t outBytes;
-@property (nonatomic, copy) NSString *hwxPath;
+@property (nonatomic, copy, nullable) NSString *hwxPath;
+@property (nonatomic, copy, nullable) NSString *bundlePath;
 @end
 
 #pragma mark - C Function Declarations

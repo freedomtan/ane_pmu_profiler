@@ -12,8 +12,8 @@ This repository contains a high-performance, self-contained Objective-C and C to
   - Unified memory DMA read/write bandwidth (`kANE_DMA_READWRITE_BYTES`)
   - Pipeline input/output stalls (`kANE_NE_OUTPUT_STALL_CYCLES`, `kANE_L2PE_INPUT_STALL_CYCLES`)
   - Dynamic DVFS frequency scaling and thermal throttling telemetry
-- **Direct Model Loading**: Reads the compiled model's `ANERegionsHash` directly from `manifest.plist` to locate and load the cached `.hwx` binary directly into `_ANEClient`.
-- **Direct Silicon Memory Mapping**: Binds precompiled `.hwx` microcode directly into `_ANEClient` via `+[_ANEModel modelAtURL:key:]` ($1.26\text{ ms}$ steady-state inference on ResNet-50 FP16).
+- **Direct Unprivileged User-Space ANE Execution (`kANEFModelANECIR`)**: Directly loads and compiles localized ANE bundles (`<regionKey>.bc.mlir` + `compiler_options_<regionKey>.plist`) via `_ANEClient` in pure user space—**no root privileges, `sudo`, or access to `/Library/Caches/com.apple.aned` required**.
+- **Direct Silicon Memory Mapping (`kANEFModelPreCompiled`)**: Alternatively binds precompiled `.hwx` microcode directly into `_ANEClient` via `+[_ANEModel modelAtURL:key:]` ($1.26\text{ ms}$ steady-state inference on ResNet-50 FP16).
 - **In-Process Host JIT Compiler**: Automatically compiles and specializes MLIR bytecode (`.mlirb`) for the host architecture (`targetSOC: "this"`) in-process without spawning external shell processes.
 - **Pure C MLIR Pass Pipeline**: Includes a native C implementation of `libODIECompiler.dylib`'s 5-pass compilation pipeline (`odiec_pipeline.c`).
 - **Comprehensive Documentation**: Includes [`ANE_Performance_PMU_Technical_Report.md`](file:///Users/freedom/work/ios-hacking/ane_pmu_profiler/ANE_Performance_PMU_Technical_Report.md) and [`ODIE_Compiler_C_API_and_Pass_Pipeline.md`](file:///Users/freedom/work/ios-hacking/ane_pmu_profiler/ODIE_Compiler_C_API_and_Pass_Pipeline.md).
@@ -39,16 +39,26 @@ flowchart TD
         PKG --> Manifest
     end
 
-    subgraph Loader ["3. Objective-C Model Loader"]
-        HWX["model.hwx<br>(Compiled ANE Microcode)"]
-        Manifest -->|Resolve Model Path| HWX
-        ANEModel["_ANEModel (+modelAtURL:key:)"]
-        HWX --> ANEModel
+    subgraph Loader ["3. Objective-C Model Loader (coreai_loader.m)"]
+        direction TB
+        subgraph ModeA ["Unprivileged User-Space Bundle (Default)"]
+            Bundle["ane_bundle/<br>region.bc.mlir + compiler_options.plist"]
+            ANEModelA["_ANEModel (+modelAtURL:key:mpsConstants:)<br>kANEFModelANECIR"]
+            Bundle --> ANEModelA
+        end
+        subgraph ModeB ["Precompiled Hardware Binary (.hwx)"]
+            HWX["model.hwx<br>(Compiled ANE Microcode)"]
+            ANEModelB["_ANEModel (+modelAtURL:key:)<br>kANEFModelPreCompiled"]
+            HWX --> ANEModelB
+        end
+        Manifest -.-> ModeA
+        Manifest -.-> ModeB
     end
 
     subgraph Silicon ["4. Physical Apple Silicon Execution and PMU"]
         Client["_ANEClient (+sharedConnection)<br>-loadModel:options:qos:error:<br>-evaluateWithModel:options:request:qos:error:"]
-        ANEModel --> Client
+        ANEModelA --> Client
+        ANEModelB --> Client
         Kernel["AppleH16ANEInterface Kernel Driver<br>(boot-args: anedebug=1)"]
         Client --> Kernel
         PMU[("Apple Neural Engine Convolution Engine<br>29 Hardware PMU Registers")]
@@ -93,17 +103,13 @@ ane_pmu_profiler/
      ```
    - Reboot the system.
    - All binaries must be ad-hoc signed with [`entitlements.plist`](file:///Users/freedom/work/ios-hacking/ane_pmu_profiler/entitlements.plist) (handled automatically by `Makefile`).
-3. **Root Permissions for System `aned` Cache**:
-   On standard macOS installations, `/Library/Caches/com.apple.aned` is created with mode `0700` (`drwx------` owned by `root:wheel`). To resolve the compiled `.hwx` microcode directly from the daemon cache:
-   - Run the loader/profiler with `sudo`:
-     ```bash
-     sudo ./dump_ane_pmu_objc resnet50_fp16.aimodel
-     ```
-   - Alternatively, grant read/execute permissions to the directory:
-     ```bash
-     sudo chmod +rx /Library/Caches/com.apple.aned
-     ```
-   - Or supply a standalone `.hwx` binary directly using `--hwx <model.hwx>` (or via `ANE_HWX_PATH` environment variable).
+3. **Unprivileged User-Space Execution (No Root / No `sudo` Required)**:
+   The profiler operates entirely in **unprivileged user space**:
+   - **Mode A: Direct User-Space ANE Bundle (`kANEFModelANECIR`, Default)**:
+     The loader locates or prepares the localized ANE bundle (`<regionKey>.bc.mlir` and `compiler_options_<regionKey>.plist`) in `<modelDir>/output_host_jit/ane_bundle`. `_ANEClient` loads and compiles the bundle into silicon without accessing root-restricted system directories.
+   - **Mode B: Precompiled Hardware Microcode (`kANEFModelPreCompiled`)**:
+     If a local `model.hwx` exists in the model directory or is specified via `ANE_HWX_PATH`, the loader binds the raw microcode directly.
+   *(Note: Accessing the system daemon cache at `/Library/Caches/com.apple.aned` is entirely optional and only occurs if readable; user-space execution works out of the box without `sudo` or changing system directory permissions).*
 4. **CoreAI Private Swift Interface Generation**:
    Because `CoreAICompiler.framework` and `CoreAIDelegates.framework` are Apple-private frameworks without public SDK headers, [swift_interface_gen](https://github.com/freedomtan/swift_interface_gen/) is used to extract and generate their `.swiftinterface` files:
    ```bash
@@ -146,7 +152,14 @@ Validates tensor buffer sizes and verifies that the model loads directly into ph
 ### 3. Live Hardware PMU Profiling Benchmark
 Dispatches real-time inference on physical ANE hardware and prints the decoded 29-register PMU report:
 ```bash
+# Standard execution (auto-detects local .hwx or runs unprivileged user-space ANE bundle)
 ./dump_ane_pmu_objc resnet50_fp16.aimodel
+
+# Explicitly force unprivileged user-space ANE bundle execution (kANEFModelANECIR)
+FORCE_USER_SPACE_ANE_BUNDLE=1 ./dump_ane_pmu_objc resnet50_fp16.aimodel
+
+# Or specify a custom standalone .hwx path
+./dump_ane_pmu_objc resnet50_fp16.aimodel --hwx path/to/model.hwx
 ```
 
 ---

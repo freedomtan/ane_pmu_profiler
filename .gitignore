@@ -5,4 +5,3 @@ dump_ane_pmu_objc
 coreai_loader
 model_compiler_objc
 output_host_jit/
-output_scenario_b_host_jit/
