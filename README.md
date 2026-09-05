@@ -106,7 +106,7 @@ ane_pmu_profiler/
 3. **Unprivileged User-Space Execution (No Root / No `sudo` Required)**:
    The profiler operates entirely in **unprivileged user space**:
    - **Mode A: Direct User-Space ANE Bundle (`kANEFModelANECIR`, Default)**:
-     The loader locates or prepares the localized ANE bundle (`<regionKey>.bc.mlir` and `compiler_options_<regionKey>.plist`) in `<modelDir>/output_host_jit/ane_bundle`. `_ANEClient` loads and compiles the bundle into silicon without accessing root-restricted system directories.
+     The loader locates or prepares the localized ANE bundle (`<regionKey>.bc.mlir` and `compiler_options_<regionKey>.plist`) in `<modelDir>/output_host_jit/ane_bundle`. The target architecture (`kANEFTargetArchitectureKey`) is resolved dynamically from `compiler_options_<regionKey>.plist` or runtime IOKit device properties (`ANEDevicePropertyTypeANEArchitectureTypeStr`), making the loader portable across Apple Silicon generations (`h13g` through `h16g/s`). `_ANEClient` loads and compiles the bundle into silicon in user space without accessing root-restricted system directories.
    - **Mode B: Precompiled Hardware Microcode (`kANEFModelPreCompiled`)**:
      If a local `model.hwx` exists in the model directory or is specified via `ANE_HWX_PATH`, the loader binds the raw microcode directly.
    *(Note: Accessing the system daemon cache at `/Library/Caches/com.apple.aned` is entirely optional and only occurs if readable; user-space execution works out of the box without `sudo` or changing system directory permissions).*
