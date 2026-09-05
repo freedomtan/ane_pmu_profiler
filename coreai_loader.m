@@ -77,21 +77,68 @@ static NSString *extractANERegionHashFromManifest(NSString *manifestPath) {
 }
 
 // Locate compiled hardware binary .hwx using deterministic region hash
-static NSString *locateCompiledHWXForHash(NSString *regionHash) {
+static NSString *locateCompiledHWXForHash(NSString *regionHash, NSString *modelDir) {
     if (!regionHash) return nil;
     NSArray *parts = [regionHash componentsSeparatedByString:@"_"];
     if ([parts count] != 2) return nil;
 
     NSString *hash1 = parts[0];
     NSString *hash2 = parts[1];
-
     NSFileManager *fm = [NSFileManager defaultManager];
-    NSString *anedCacheRoot = @"/Library/Caches/com.apple.aned/26A5425a/ModelAssetsCache";
-    NSArray *subdirs = [fm contentsOfDirectoryAtPath:anedCacheRoot error:nil];
-    for (NSString *sub in subdirs) {
-        NSString *candidate = [NSString stringWithFormat:@"%@/%@/%@/%@/model.hwx", anedCacheRoot, sub, hash1, hash2];
-        if ([fm fileExistsAtPath:candidate]) {
-            return candidate;
+
+    // 1. Check ANE_HWX_PATH environment variable
+    const char *envHwx = getenv("ANE_HWX_PATH");
+    if (envHwx && strlen(envHwx) > 0) {
+        NSString *envPath = [NSString stringWithUTF8String:envHwx];
+        if ([fm fileExistsAtPath:envPath]) return envPath;
+    }
+
+    // 2. Check local model directory and working directory for standalone .hwx
+    if (modelDir) {
+        NSArray *localCandidates = @[
+            [modelDir stringByAppendingPathComponent:@"model.hwx"],
+            [modelDir stringByAppendingPathComponent:[NSString stringWithFormat:@"%@.hwx", hash1]],
+            [modelDir stringByAppendingPathComponent:@"output_host_jit/model.hwx"],
+            @"model.hwx"
+        ];
+        for (NSString *cand in localCandidates) {
+            if ([fm fileExistsAtPath:cand]) {
+                return cand;
+            }
+        }
+    }
+
+    // 3. Check system /Library/Caches/com.apple.aned
+    NSString *anedBase = @"/Library/Caches/com.apple.aned";
+    if (![fm fileExistsAtPath:anedBase]) {
+        return nil;
+    }
+
+    if (access([anedBase UTF8String], R_OK | X_OK) != 0) {
+        fprintf(stderr, "\n⚠️  NOTICE: '%s' is not accessible (requires ROOT permissions).\n", [anedBase UTF8String]);
+        fprintf(stderr, "    On standard macOS, this cache directory is restricted to root (mode 0700).\n");
+        fprintf(stderr, "    Solutions:\n");
+        fprintf(stderr, "      • Run profiler with 'sudo':\n");
+        fprintf(stderr, "          sudo ./dump_ane_pmu_objc %s\n", modelDir ? [modelDir UTF8String] : "resnet50_fp16.aimodel");
+        fprintf(stderr, "      • Or provide a standalone .hwx directly:\n");
+        fprintf(stderr, "          ./dump_ane_pmu_objc --hwx <path/to/model.hwx>\n");
+        fprintf(stderr, "      • Or grant read permission to the cache directory:\n");
+        fprintf(stderr, "          sudo chmod +rx %s\n\n", [anedBase UTF8String]);
+        return nil;
+    }
+
+    // Enumerate OS build subdirectories dynamically (avoiding hardcoded OS build numbers)
+    NSArray *osBuilds = [fm contentsOfDirectoryAtPath:anedBase error:nil];
+    for (NSString *build in osBuilds) {
+        NSString *assetsCache = [NSString stringWithFormat:@"%@/%@/ModelAssetsCache", anedBase, build];
+        if (![fm fileExistsAtPath:assetsCache]) continue;
+
+        NSArray *subdirs = [fm contentsOfDirectoryAtPath:assetsCache error:nil];
+        for (NSString *sub in subdirs) {
+            NSString *candidate = [NSString stringWithFormat:@"%@/%@/%@/%@/model.hwx", assetsCache, sub, hash1, hash2];
+            if ([fm fileExistsAtPath:candidate]) {
+                return candidate;
+            }
         }
     }
     return nil;
@@ -166,8 +213,8 @@ BOOL load_coreai_for_aneclient(const char *modelPath, void **outResult) {
             return NO;
         }
 
-        // 4. Locate compiled .hwx binary in aned cache
-        NSString *foundHWX = locateCompiledHWXForHash(regionHash);
+        // 4. Locate compiled .hwx binary (checking local paths and aned cache)
+        NSString *foundHWX = locateCompiledHWXForHash(regionHash, modelDir);
 
         if (!foundHWX) {
             fprintf(stderr, "❌ Could not locate compiled model.hwx for region hash: %s\n", [regionHash UTF8String]);

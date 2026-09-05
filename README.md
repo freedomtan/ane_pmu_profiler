@@ -93,7 +93,18 @@ ane_pmu_profiler/
      ```
    - Reboot the system.
    - All binaries must be ad-hoc signed with [`entitlements.plist`](file:///Users/freedom/work/ios-hacking/ane_pmu_profiler/entitlements.plist) (handled automatically by `Makefile`).
-3. **CoreAI Private Swift Interface Generation**:
+3. **Root Permissions for System `aned` Cache**:
+   On standard macOS installations, `/Library/Caches/com.apple.aned` is created with mode `0700` (`drwx------` owned by `root:wheel`). To resolve the compiled `.hwx` microcode directly from the daemon cache:
+   - Run the loader/profiler with `sudo`:
+     ```bash
+     sudo ./dump_ane_pmu_objc resnet50_fp16.aimodel
+     ```
+   - Alternatively, grant read/execute permissions to the directory:
+     ```bash
+     sudo chmod +rx /Library/Caches/com.apple.aned
+     ```
+   - Or supply a standalone `.hwx` binary directly using `--hwx <model.hwx>` (or via `ANE_HWX_PATH` environment variable).
+4. **CoreAI Private Swift Interface Generation**:
    Because `CoreAICompiler.framework` and `CoreAIDelegates.framework` are Apple-private frameworks without public SDK headers, [swift_interface_gen](https://github.com/freedomtan/swift_interface_gen/) is used to extract and generate their `.swiftinterface` files:
    ```bash
    git clone https://github.com/freedomtan/swift_interface_gen.git ~/work/swift_interface_gen

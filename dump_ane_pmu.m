@@ -3,9 +3,9 @@
 // Apple Neural Engine (ANE) Silicon PMU Register Dump & Live Hardware Telemetry
 //
 // Supports:
-//   Option A: On-the-fly CoreML MIL compilation via _ANEClient (e.g. .mlmodelc)
-//   Option B: Direct trusted cache injection & execution of precompiled .hwx
-//   Option C: Direct CoreAI / .aimodel / .mlirb JIT & live _ANEClient execution (without copying .hwx)
+//   - On-the-fly CoreML MIL compilation via _ANEClient (e.g. .mlmodelc)
+//   - Direct execution of standalone precompiled .hwx binaries
+//   - Direct CoreAI / .aimodel / .mlirb JIT & live _ANEClient execution
 //
 // Checks driver gate status, allocates statType=2 PMU IOSurface buffer,
 // dispatches live inference on physical silicon, and decodes all 29 hardware registers.
@@ -29,9 +29,9 @@ extern NSString * const kANEFModelPreCompiledValue;
 extern NSString * const kANEFPerformanceStatsMaskKey;
 
 typedef enum {
-    RUN_MODE_HWX = 0,     // Option B: Pre-compiled .hwx
-    RUN_MODE_COMPILE = 1, // Option A: .mlmodelc via _ANEClient
-    RUN_MODE_COREAI = 2   // Option C: .aimodel / .mlirb via CoreAI & direct _ANEClient without copying .hwx
+    RUN_MODE_HWX = 0,     // Standalone pre-compiled .hwx binary
+    RUN_MODE_COMPILE = 1, // CoreML .mlmodelc via _ANEClient
+    RUN_MODE_COREAI = 2   // CoreAI .aimodel / .mlirb via host JIT & _ANEClient
 } RunMode;
 
 typedef struct {
@@ -185,7 +185,7 @@ BOOL runLiveInferenceAndCapturePmu(const Config *cfg) {
 
     if (cfg->runMode == RUN_MODE_COREAI) {
         printf("⚡️ DISPATCHING LIVE INFERENCE ON PHYSICAL ANE SILICON...\n");
-        printf("  • Execution Pipeline       : OPTION C (Direct CoreAI JIT -> ANEClient without copying .hwx)\n");
+        printf("  • Execution Pipeline       : CoreAI Host JIT -> Direct _ANEClient Execution\n");
         printf("  • Model File Path          : %s\n", cfg->modelPath.UTF8String);
 
         void *rawResult = NULL;
@@ -214,7 +214,7 @@ BOOL runLiveInferenceAndCapturePmu(const Config *cfg) {
         // 1. Connect to ANE Daemon
         client = [clientCls valueForKey:@"sharedConnection"];
         printf("⚡️ DISPATCHING LIVE INFERENCE ON PHYSICAL ANE SILICON...\n");
-        printf("  • Execution Pipeline       : %s\n", cfg->runMode == RUN_MODE_COMPILE ? "OPTION A (On-The-Fly _ANEClient Compile)" : "OPTION B (Direct Trusted Cache Injection)");
+        printf("  • Execution Pipeline       : %s\n", cfg->runMode == RUN_MODE_COMPILE ? "_ANEClient JIT Compilation" : "Pre-Compiled .hwx Execution");
         printf("  • Model File Path          : %s\n", cfg->modelPath.UTF8String);
         printf("  • Daemon Client Connection : %p\n", (__bridge void *)client);
 
@@ -509,9 +509,9 @@ void decodeAndDumpPmuRegisters(BOOL isUnlocked) {
 void printUsage(const char *progName) {
     printf("Usage: %s [options] [model_path]\n\n", progName);
     printf("Pipelines / Options:\n");
-    printf("  --coreai <path.aimodel|path.mlirb>  Option C (Recommended): Direct CoreAI JIT -> ANEClient run without copying .hwx\n");
-    printf("  --compile <path.mlmodelc>           Option A: Compile CoreML package via _ANEClient and profile\n");
-    printf("  --hwx <path.hwx>                    Option B: Directly load pre-compiled .hwx from trusted cache and profile\n");
+    printf("  --coreai <path.aimodel|path.mlirb>  Direct CoreAI JIT -> ANEClient execution\n");
+    printf("  --compile <path.mlmodelc>           Compile CoreML package via _ANEClient and profile\n");
+    printf("  --hwx <path.hwx>                    Directly load standalone pre-compiled .hwx and profile\n");
     printf("  --in-size <bytes>                   Input IOSurface allocation size (decimal or hex, e.g. 0x24c000)\n");
     printf("  --out-size <bytes>                  Output IOSurface allocation size (decimal or hex, e.g. 0x4000)\n");
     printf("  --iters <count>                     Number of inference iterations (default: 5)\n");
@@ -519,8 +519,8 @@ void printUsage(const char *progName) {
     printf("Examples:\n");
     printf("  %s --coreai resnet50_fp16.aimodel\n", progName);
     printf("  %s --coreai resnet50_fp16.aimodel/main.mlirb\n", progName);
-    printf("  %s --hwx out_resnet_hwx/model.hwx\n", progName);
-    printf("  %s --compile /Users/freedom/work/mil/ResNet50_fp16.mlmodelc\n\n", progName);
+    printf("  %s --hwx model.hwx\n", progName);
+    printf("  %s --compile ResNet50_fp16.mlmodelc\n\n", progName);
 }
 
 int main(int argc, const char * argv[]) {
@@ -569,9 +569,9 @@ int main(int argc, const char * argv[]) {
 
         // Auto-detect defaults if not specified
         if (!cfg.modelPath) {
-            NSString *defCoreAI = @"/Users/freedom/work/ios-hacking/disassm_b7/resnet50_fp16.aimodel";
-            NSString *defHwx = @"/Library/Caches/com.apple.aned/26A5425a/my_model/model.hwx";
-            NSString *defMil = @"/Users/freedom/work/mil/ResNet50_fp16.mlmodelc";
+            NSString *defCoreAI = @"resnet50_fp16.aimodel";
+            NSString *defHwx = @"model.hwx";
+            NSString *defMil = @"ResNet50_fp16.mlmodelc";
 
             if ([[NSFileManager defaultManager] fileExistsAtPath:defCoreAI]) {
                 cfg.runMode = RUN_MODE_COREAI;
