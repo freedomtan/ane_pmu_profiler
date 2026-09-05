@@ -5,6 +5,7 @@ ENTITLEMENTS = entitlements.plist
 
 ANE_FRAMEWORKS = -F /System/Library/PrivateFrameworks -framework AppleNeuralEngine -framework IOSurface $(FRAMEWORKS) -framework Metal -framework MetalPerformanceShaders -framework MetalPerformanceShadersGraph
 
+# Private CoreAI framework interfaces generated via https://github.com/freedomtan/swift_interface_gen/
 LOCAL_FRAMEWORKS = $(HOME)/work/swift_interface_gen/LocalFrameworks
 
 SWIFT_LIBS = -L/Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift/macosx -rpath /Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift/macosx -F $(LOCAL_FRAMEWORKS) -framework CoreAICompiler -framework CoreAIDelegates

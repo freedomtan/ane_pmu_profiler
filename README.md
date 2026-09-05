@@ -93,6 +93,13 @@ ane_pmu_profiler/
      ```
    - Reboot the system.
    - All binaries must be ad-hoc signed with [`entitlements.plist`](file:///Users/freedom/work/ios-hacking/ane_pmu_profiler/entitlements.plist) (handled automatically by `Makefile`).
+3. **CoreAI Private Swift Interface Generation**:
+   Because `CoreAICompiler.framework` and `CoreAIDelegates.framework` are Apple-private frameworks without public SDK headers, [swift_interface_gen](https://github.com/freedomtan/swift_interface_gen/) is used to extract and generate their `.swiftinterface` files:
+   ```bash
+   git clone https://github.com/freedomtan/swift_interface_gen.git ~/work/swift_interface_gen
+   # Generates LocalFrameworks/CoreAICompiler.framework and LocalFrameworks/CoreAIDelegates.framework
+   ```
+   The `Makefile` resolves these private module interfaces via `LOCAL_FRAMEWORKS = $(HOME)/work/swift_interface_gen/LocalFrameworks`.
 
 ---
 
