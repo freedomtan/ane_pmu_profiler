@@ -35,6 +35,33 @@ static NSString *getSystemANEArchitecture(void) {
     return archStr ?: @"h13g";
 }
 
+static size_t bytesPerElementForMPSDataType(MPSDataType dataType) {
+    switch (dataType) {
+        case MPSDataTypeFloat32:
+        case MPSDataTypeInt32:
+        case MPSDataTypeUInt32:
+            return 4;
+        case MPSDataTypeFloat16:
+        case MPSDataTypeBFloat16:
+        case MPSDataTypeInt16:
+        case MPSDataTypeUInt16:
+            return 2;
+        case MPSDataTypeInt8:
+        case MPSDataTypeUInt8:
+        case MPSDataTypeBool:
+            return 1;
+        case MPSDataTypeInt64:
+        case MPSDataTypeUInt64:
+        case MPSDataTypeComplexFloat32:
+            return 8;
+        default:
+            if ((dataType & 0xFF) >= 8) {
+                return (dataType & 0xFF) / 8;
+            }
+            return 2;
+    }
+}
+
 // Inspect tensor dimensions directly using MPSGraphExecutable
 static BOOL inspectModelTensorsViaMPSGraph(NSString *mlirbPath, uint64_t *outInBytes, uint64_t *outOutBytes) {
     NSData *bytecode = [NSData dataWithContentsOfFile:mlirbPath];
@@ -56,11 +83,9 @@ static BOOL inspectModelTensorsViaMPSGraph(NSString *mlirbPath, uint64_t *outInB
     NSArray<MPSGraphShapedType *> *inShapes = [exec getInputShapesForFunction:@"main"];
     for (MPSGraphShapedType *st in inShapes) {
         NSArray<NSNumber *> *shape = st.shape;
-        unsigned int dt = (unsigned int)st.dataType;
         uint64_t count = 1;
         for (NSNumber *n in shape) count *= [n unsignedLongLongValue];
-        // 0x10000020: Float32 (4 bytes), 0x10000008/0x20000008: Int8/UInt8 (1 byte), 0x10000010: Float16 (2 bytes)
-        uint64_t bpe = (dt == 0x10000020) ? 4 : ((dt == 0x10000008 || dt == 0x20000008) ? 1 : 2);
+        size_t bpe = bytesPerElementForMPSDataType(st.dataType);
         uint64_t sz = count * bpe;
         if (sz > detectedIn) detectedIn = sz;
     }
@@ -68,10 +93,9 @@ static BOOL inspectModelTensorsViaMPSGraph(NSString *mlirbPath, uint64_t *outInB
     NSArray<MPSGraphShapedType *> *outShapes = [exec getOutputShapesForFunction:@"main"];
     for (MPSGraphShapedType *st in outShapes) {
         NSArray<NSNumber *> *shape = st.shape;
-        unsigned int dt = (unsigned int)st.dataType;
         uint64_t count = 1;
         for (NSNumber *n in shape) count *= [n unsignedLongLongValue];
-        uint64_t bpe = (dt == 0x10000020) ? 4 : ((dt == 0x10000008 || dt == 0x20000008) ? 1 : 2);
+        size_t bpe = bytesPerElementForMPSDataType(st.dataType);
         uint64_t sz = count * bpe;
         if (sz > detectedOut) detectedOut = sz;
     }
@@ -200,8 +224,7 @@ static BOOL locateOrPrepareANEBundle(NSString *modelDir, NSString *mlirbFile, NS
     for (MPSGraphShapedType *st in inShapes) {
         uint64_t count = 1;
         for (NSNumber *n in st.shape) count *= [n unsignedLongLongValue];
-        unsigned int dt = (unsigned int)st.dataType;
-        uint64_t bpe = (dt == 0x10000020) ? 4 : ((dt == 0x10000008 || dt == 0x20000008) ? 1 : 2);
+        size_t bpe = bytesPerElementForMPSDataType(st.dataType);
         size_t bytes = (size_t)(count * bpe);
         if (bytes == 0) bytes = 0x1000;
         id<MTLBuffer> buf = [device newBufferWithLength:bytes options:MTLResourceStorageModeShared];
