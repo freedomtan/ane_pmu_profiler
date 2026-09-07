@@ -523,7 +523,7 @@ int main(int argc, const char * argv[]) {
             } else if ([arg isEqualToString:@"--help"] || [arg isEqualToString:@"-h"]) {
                 printUsage(argv[0]);
                 return 0;
-            } else if (i == 1 && ![arg hasPrefix:@"-"]) {
+            } else if (![arg hasPrefix:@"-"] && !cfg.modelPath) {
                 // Direct positional argument: auto-detect pipeline
                 if ([arg hasSuffix:@".hwx"]) {
                     cfg.runMode = RUN_MODE_HWX;
