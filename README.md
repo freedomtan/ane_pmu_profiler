@@ -149,6 +149,7 @@ The profiler supports multiple neural network representations out of the box wit
 | **ANECIR Bundle** | `compiler_options_*.plist` + `*.bc.mlir` / `net.plist` | Unprivileged user-space compilation via `_ANEClient` (`kANEFModelANECIR`) |
 | **Precompiled Hardware Binary** | Standalone `.hwx` | Directly mapped into ANE silicon memory via `_ANEClient` (`kANEFModelPreCompiled`) |
 | **CoreAI Graph** | `.aimodel` package or `main.mlirb` | Specialized via host JIT & executed via `_ANEClient` |
+| **Apple Intelligence ODIE Package** | `model.odixpackage` bundle | Automatically resolves internal compiled ANE microcode (`binary_*.hwx`) & profiles |
 
 ### 1. Live Hardware PMU Profiling Benchmark
 Pass any supported model directly. Format detection, multi-tensor shape extraction, and `IOSurface` allocation are automatic:
@@ -174,6 +175,9 @@ Pass any supported model directly. Format detection, multi-tensor shape extracti
 
 # Precompiled hardware binary (.hwx)
 ./dump_ane_pmu_objc model.hwx
+
+# Apple Intelligence Foundation Model (.odixpackage)
+./dump_ane_pmu_objc /System/Library/AssetsV2/com_apple_MobileAsset_UAF_FM_GenerativeModels/.../model.odixpackage
 
 # CoreAI .aimodel package
 ./dump_ane_pmu_objc resnet50_fp16.aimodel

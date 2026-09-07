@@ -52,7 +52,8 @@ typedef enum {
     RUN_MODE_ESPRESSO,   // model.espresso.net
     RUN_MODE_ANECIR,     // compiler_options_*.plist + *.bc.mlir / net.plist
     RUN_MODE_HWX,        // Standalone pre-compiled .hwx binary
-    RUN_MODE_COREAI      // CoreAI .aimodel / .mlirb via host JIT & _ANEClient
+    RUN_MODE_COREAI,     // CoreAI .aimodel / .mlirb via host JIT & _ANEClient
+    RUN_MODE_ODIX        // Apple Intelligence ODIE package (.odixpackage)
 } RunMode;
 
 typedef struct {
@@ -244,6 +245,24 @@ static IOSurfaceRef createIOSurfaceWithSize(size_t allocSize) {
     return IOSurfaceCreate((CFDictionaryRef)props);
 }
 
+// --- Helper: Find .hwx binary in package ---
+static NSString *findHWXInPackage(NSString *packagePath) {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSDirectoryEnumerator *enumerator = [fm enumeratorAtPath:packagePath];
+    NSString *file = nil;
+    NSString *firstHwx = nil;
+    while ((file = [enumerator nextObject])) {
+        if ([file hasSuffix:@".hwx"]) {
+            NSString *fullPath = [packagePath stringByAppendingPathComponent:file];
+            if ([file.lastPathComponent isEqualToString:@"binary_0.hwx"]) {
+                return fullPath;
+            }
+            if (!firstHwx) firstHwx = fullPath;
+        }
+    }
+    return firstHwx;
+}
+
 // --- Auto-Detect Model Format ---
 
 static RunMode detectModelFormat(NSString *path) {
@@ -254,6 +273,9 @@ static RunMode detectModelFormat(NSString *path) {
     }
 
     if (isDir) {
+        if ([path hasSuffix:@".odixpackage"] || [fm fileExistsAtPath:[path stringByAppendingPathComponent:@"program.odix"]]) {
+            return RUN_MODE_ODIX;
+        }
         if ([path hasSuffix:@".mlpackage"]) {
             return RUN_MODE_COREML;
         }
@@ -268,6 +290,9 @@ static RunMode detectModelFormat(NSString *path) {
         }
         NSArray *items = [fm contentsOfDirectoryAtPath:path error:nil];
         for (NSString *item in items) {
+            if ([item hasSuffix:@".odix"]) {
+                return RUN_MODE_ODIX;
+            }
             if ([item hasPrefix:@"compiler_options"] && [item hasSuffix:@".plist"]) {
                 return RUN_MODE_ANECIR;
             }
@@ -287,6 +312,9 @@ static RunMode detectModelFormat(NSString *path) {
         return RUN_MODE_COREML;
     } else {
         // Single file
+        if ([path hasSuffix:@".odix"]) {
+            return RUN_MODE_ODIX;
+        }
         if ([path hasSuffix:@".mlmodel"]) {
             return RUN_MODE_COREML;
         }
@@ -633,6 +661,33 @@ BOOL runLiveInferenceAndCapturePmu(Config *cfg) {
             printf("❌ Failed to load ANECIR model into ANE silicon: %s\n", loadErr.localizedDescription.UTF8String ?: "Unknown");
             return NO;
         }
+    } else if (cfg->runMode == RUN_MODE_ODIX) {
+        printf("  • Execution Pipeline       : Apple Intelligence ODIE Package (.odixpackage)\n");
+        NSString *hwxPath = findHWXInPackage(cfg->modelPath);
+        if (!hwxPath) {
+            printf("❌ Could not locate compiled ANE microcode (binary_*.hwx) inside %s\n", cfg->modelPath.UTF8String);
+            return NO;
+        }
+        printf("  • Located ANE Hardware HWX : %s\n", hwxPath.UTF8String);
+
+        client = [_ANEClient sharedConnection];
+        NSURL *hwxURL = [NSURL fileURLWithPath:hwxPath];
+        model = [_ANEModel modelAtURL:hwxURL key:@"net"];
+        if (!model) {
+            printf("❌ Failed to instantiate _ANEModel for %s\n", hwxPath.UTF8String);
+            return NO;
+        }
+
+        NSError *loadErr = nil;
+        NSDictionary *loadOpts = @{
+            kANEFModelTypeKey: kANEFModelPreCompiledValue,
+            kANEFPerformanceStatsMaskKey: @(15)
+        };
+        BOOL loadOk = [client loadModel:model options:loadOpts qos:25 error:&loadErr];
+        if (!loadOk) {
+            printf("❌ Failed to load ODIE ANE binary into silicon: %s\n", loadErr.localizedDescription.UTF8String ?: "Unknown");
+            return NO;
+        }
     }
 
     printf("  • Daemon Client Connection : %p\n", (__bridge void *)client);
@@ -935,7 +990,8 @@ void printUsage(const char *progName) {
     printf("  3. Espresso IR         : model.espresso.net (with .shape / .weights), or .mlmodelc\n");
     printf("  4. ANECIR Bundles      : compiler_options_*.plist + *.bc.mlir / net.plist\n");
     printf("  5. Pre-compiled HWX    : standalone .hwx binary\n");
-    printf("  6. CoreAI Graphs       : .aimodel package or .mlirb graph\n\n");
+    printf("  6. CoreAI Graphs       : .aimodel package or .mlirb graph\n");
+    printf("  7. ODIE Packages       : .odixpackage (Apple Intelligence Foundation Models)\n\n");
     printf("Options:\n");
     printf("  --coreml <path>        Profile CoreML model (.mlmodel, .mlpackage, or .mlmodelc)\n");
     printf("  --mil <path>           Profile MIL model (.mil file or directory containing model.mil)\n");
@@ -943,6 +999,7 @@ void printUsage(const char *progName) {
     printf("  --anecir <path>        Profile unprivileged user-space ANECIR bundle directory\n");
     printf("  --hwx <path>           Profile pre-compiled hardware binary (.hwx)\n");
     printf("  --coreai <path>        Profile CoreAI package (.aimodel) or MLIR bytecode (.mlirb)\n");
+    printf("  --odix <path>          Profile Apple Intelligence ODIE package (.odixpackage)\n");
     printf("  --compile <path>       Compile and load model via _ANEClient and profile\n");
     printf("  --in-size <bytes>      Override input IOSurface size (hex e.g. 0x24c000, or decimal)\n");
     printf("  --out-size <bytes>     Override output IOSurface size (hex e.g. 0x4000, or decimal)\n");
@@ -956,6 +1013,7 @@ void printUsage(const char *progName) {
     printf("  %s MobileNetV2.mlmodelc/model.espresso.net\n", progName);
     printf("  %s --anecir resnet50_fp16.aimodel/output_host_jit/ane_bundle\n", progName);
     printf("  %s --hwx model.hwx\n", progName);
+    printf("  %s --odix path/to/model.odixpackage\n", progName);
     printf("  %s --coreai resnet50_fp16.aimodel\n\n", progName);
 }
 
@@ -981,6 +1039,9 @@ int main(int argc, const char * argv[]) {
                 cfg.modelPath = [NSString stringWithUTF8String:argv[++i]];
             } else if ([arg isEqualToString:@"--anecir"] && i + 1 < argc) {
                 cfg.runMode = RUN_MODE_ANECIR;
+                cfg.modelPath = [NSString stringWithUTF8String:argv[++i]];
+            } else if ([arg isEqualToString:@"--odix"] && i + 1 < argc) {
+                cfg.runMode = RUN_MODE_ODIX;
                 cfg.modelPath = [NSString stringWithUTF8String:argv[++i]];
             } else if ([arg isEqualToString:@"--coreai"] && i + 1 < argc) {
                 cfg.runMode = RUN_MODE_COREAI;
