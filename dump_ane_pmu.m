@@ -266,10 +266,12 @@ static RunMode detectModelFormat(NSString *path) {
             }
             return RUN_MODE_COREML;
         }
-        // Check contents of arbitrary directory
         NSArray *items = [fm contentsOfDirectoryAtPath:path error:nil];
         for (NSString *item in items) {
-            if ([item hasPrefix:@"compiler_options_"] && [item hasSuffix:@".plist"]) {
+            if ([item hasPrefix:@"compiler_options"] && [item hasSuffix:@".plist"]) {
+                return RUN_MODE_ANECIR;
+            }
+            if ([item isEqualToString:@"net.plist"] || [item hasSuffix:@".bc.mlir"]) {
                 return RUN_MODE_ANECIR;
             }
             if ([item isEqualToString:@"model.espresso.net"]) {
@@ -534,49 +536,78 @@ BOOL runLiveInferenceAndCapturePmu(Config *cfg) {
             bundleDir = [cfg->modelPath stringByDeletingLastPathComponent];
         }
 
-        // Discover compiler_options_*.plist and net file
-        NSString *regionKey = @"net";
+        // Discover net file and compiler options
+        NSString *regionKey = nil;
         NSString *compilerOptionsFile = nil;
         NSString *netFile = nil;
 
         NSArray *entries = [fm contentsOfDirectoryAtPath:bundleDir error:nil];
+
+        // 1. Look for .bc.mlir (Modern ANECIR)
         for (NSString *entry in entries) {
-            if ([entry hasPrefix:@"compiler_options_"] && [entry hasSuffix:@".plist"]) {
-                compilerOptionsFile = entry;
-                NSString *sub = [entry substringFromIndex:17]; // strip "compiler_options_"
-                regionKey = [sub substringToIndex:sub.length - 6]; // strip ".plist"
+            if ([entry hasSuffix:@".bc.mlir"]) {
+                netFile = entry;
+                regionKey = [entry substringToIndex:(entry.length - @".bc.mlir".length)];
+                break;
             }
         }
 
-        if (compilerOptionsFile) {
-            NSString *candidateMlir = [NSString stringWithFormat:@"%@.bc.mlir", regionKey];
-            NSString *candidatePlist = [NSString stringWithFormat:@"%@.plist", regionKey];
-            if ([entries containsObject:candidateMlir]) {
-                netFile = candidateMlir;
-            } else if ([entries containsObject:candidatePlist]) {
-                netFile = candidatePlist;
+        // 2. Look for net.plist / <region>.plist (Classic ANECIR)
+        if (!netFile) {
+            if ([entries containsObject:@"net.plist"]) {
+                netFile = @"net.plist";
+                regionKey = @"net";
+            } else {
+                for (NSString *entry in entries) {
+                    if ([entry hasSuffix:@".plist"] && ![entry hasPrefix:@"compiler_options"]) {
+                        netFile = entry;
+                        regionKey = [entry substringToIndex:(entry.length - @".plist".length)];
+                        break;
+                    }
+                }
+            }
+        }
+
+        if (!regionKey) regionKey = @"net";
+
+        // 3. Look for compiler options plist matching regionKey or generic
+        NSString *cand = [NSString stringWithFormat:@"compiler_options_%@.plist", regionKey];
+        if ([entries containsObject:cand]) {
+            compilerOptionsFile = cand;
+        } else if ([entries containsObject:@"compiler_options.plist"]) {
+            compilerOptionsFile = @"compiler_options.plist";
+        } else {
+            for (NSString *entry in entries) {
+                if ([entry hasPrefix:@"compiler_options"] && [entry hasSuffix:@".plist"]) {
+                    compilerOptionsFile = entry;
+                    break;
+                }
             }
         }
 
         if (!netFile) {
-            if ([entries containsObject:@"net.plist"]) netFile = @"net.plist";
-            else if ([entries containsObject:@"model.plist"]) netFile = @"model.plist";
-        }
-
-        if (!compilerOptionsFile || !netFile) {
-            printf("❌ Could not locate matching compiler_options_*.plist and net file in %s\n", bundleDir.UTF8String);
+            printf("❌ Could not locate ANECIR network file (*.bc.mlir or *.plist) in %s\n", bundleDir.UTF8String);
             return NO;
         }
-
-        printf("  • ANECIR Bundle Directory  : %s\n", bundleDir.UTF8String);
-        printf("  • Region Key               : %s\n", regionKey.UTF8String);
-        printf("  • Compiler Options File    : %s\n", compilerOptionsFile.UTF8String);
-        printf("  • Net Representation File  : %s\n", netFile.UTF8String);
 
         // Prioritize actual physical host silicon architecture for ANECIR
         NSString *targetArch = querySystemANEArchitecture();
         if (!targetArch || targetArch.length == 0) {
             targetArch = @"h16g";
+        }
+
+        // 4. If no compiler options file exists, generate a minimal one on-the-fly!
+        if (!compilerOptionsFile) {
+            compilerOptionsFile = [NSString stringWithFormat:@"compiler_options_%@.plist", regionKey];
+            NSString *genPath = [bundleDir stringByAppendingPathComponent:compilerOptionsFile];
+            NSDictionary *genDict = @{
+                targetArch: @{
+                    @"SpatialSplitMode": @"GenericDAG",
+                    @"TargetArchitecture": targetArch
+                }
+            };
+            [genDict writeToFile:genPath atomically:YES];
+            printf("  • Generated Compiler Opts  : %s (auto-configured for %s)\n", compilerOptionsFile.UTF8String, targetArch.UTF8String);
         }
         printf("  • Target Architecture      : %s\n", targetArch.UTF8String);
 
