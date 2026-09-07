@@ -3,7 +3,7 @@ CFLAGS = -O2 -fobjc-arc -Wall
 FRAMEWORKS = -framework Foundation -framework IOKit -framework Security
 ENTITLEMENTS = entitlements.plist
 
-ANE_FRAMEWORKS = -F /System/Library/PrivateFrameworks -framework AppleNeuralEngine -framework IOSurface $(FRAMEWORKS) -framework Metal -framework MetalPerformanceShaders -framework MetalPerformanceShadersGraph
+ANE_FRAMEWORKS = -F /System/Library/PrivateFrameworks -framework AppleNeuralEngine -framework IOSurface $(FRAMEWORKS) -framework Metal -framework MetalPerformanceShaders -framework MetalPerformanceShadersGraph -framework CoreML
 
 # Private CoreAI framework interfaces generated via https://github.com/freedomtan/swift_interface_gen/
 LOCAL_FRAMEWORKS = $(HOME)/work/swift_interface_gen/LocalFrameworks

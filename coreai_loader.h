@@ -33,6 +33,7 @@ NS_ASSUME_NONNULL_BEGIN
 @property (nonatomic, assign) unsigned long long programHandle;
 @property (nonatomic, copy, nullable) NSString *cacheURLIdentifier;
 @property (nonatomic, readonly) NSURL *modelURL;
+@property (nonatomic, strong, nullable) NSDictionary *modelAttributes;
 + (nullable instancetype)modelAtURL:(NSURL *)url key:(NSString *)key;
 + (nullable instancetype)modelAtURL:(NSURL *)url key:(NSString *)key mpsConstants:(nullable NSString *)mpsConstants;
 @end

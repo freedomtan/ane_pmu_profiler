@@ -135,31 +135,69 @@ This compiles and signs:
 
 ---
 
-## 6. Usage & Workflows
+## 6. Usage & Multi-Format Workflows
 
-### 1. Specialize Model for Host ANE Silicon
-Compiles `.mlirb` bytecode into an `mpsgraphpackage` specialized for the host machine:
-```bash
-./model_compiler_objc resnet50_fp16.aimodel/main.mlirb resnet50_fp16.aimodel/output_host_jit
-```
+The profiler supports multiple neural network representations out of the box with automatic format detection:
 
-### 2. Standalone Model Loading & Inspection
-Validates tensor buffer sizes and verifies that the model loads directly into physical ANE silicon:
-```bash
-./coreai_loader resnet50_fp16.aimodel
-```
+| Model Format | Representation / Files | Profiler Pipeline |
+| :--- | :--- | :--- |
+| **CoreML Packages** | `.mlpackage` directory bundle | Compiled on-the-fly via `MLModel compileModelAtURL:`, loaded via `_ANEClient` |
+| **CoreML Single File** | `.mlmodel` standalone file | Compiled on-the-fly via `MLModel compileModelAtURL:`, loaded via `_ANEClient` |
+| **Compiled CoreML** | `.mlmodelc` directory | Directly loaded and compiled via `_ANEClient` (`kANEFModelMIL` or `kANEFModelEspresso`) |
+| **Model Intermediate Language** | Standalone `.mil` or `model.mil` | Loaded & compiled via `_ANEClient` (`kANEFModelMIL`) |
+| **Espresso IR** | `model.espresso.net` (with `.shape`/`.weights`) | Loaded & compiled via `_ANEClient` (`kANEFModelEspresso`) |
+| **ANECIR Bundle** | `compiler_options_*.plist` + `*.bc.mlir` / `net.plist` | Unprivileged user-space compilation via `_ANEClient` (`kANEFModelANECIR`) |
+| **Precompiled Hardware Binary** | Standalone `.hwx` | Directly mapped into ANE silicon memory via `_ANEClient` (`kANEFModelPreCompiled`) |
+| **CoreAI Graph** | `.aimodel` package or `main.mlirb` | Specialized via host JIT & executed via `_ANEClient` |
 
-### 3. Live Hardware PMU Profiling Benchmark
-Dispatches real-time inference on physical ANE hardware and prints the decoded 29-register PMU report:
+### 1. Live Hardware PMU Profiling Benchmark
+Pass any supported model directly. Format detection, multi-tensor shape extraction, and `IOSurface` allocation are automatic:
+
 ```bash
-# Standard execution (auto-detects local .hwx or runs unprivileged user-space ANE bundle)
+# CoreML .mlpackage bundle (auto-compiles on-the-fly and profiles)
+./dump_ane_pmu_objc MobilenetV4_Large.mlpackage
+
+# CoreML .mlmodel single-file model
+./dump_ane_pmu_objc MobileDet.mlmodel
+
+# Compiled CoreML .mlmodelc directory
+./dump_ane_pmu_objc ResNet50_fp16.mlmodelc
+
+# Standalone MIL file
+./dump_ane_pmu_objc /path/to/model.mil
+
+# Espresso IR network
+./dump_ane_pmu_objc MobileNetV2.mlmodelc/model.espresso.net
+
+# Direct unprivileged user-space ANECIR bundle
+./dump_ane_pmu_objc resnet50_fp16.aimodel/output_host_jit/ane_bundle
+
+# Precompiled hardware binary (.hwx)
+./dump_ane_pmu_objc model.hwx
+
+# CoreAI .aimodel package
 ./dump_ane_pmu_objc resnet50_fp16.aimodel
+```
 
-# Explicitly force unprivileged user-space ANE bundle execution (kANEFModelANECIR)
-FORCE_USER_SPACE_ANE_BUNDLE=1 ./dump_ane_pmu_objc resnet50_fp16.aimodel
+### 2. Manual CLI Format Flags & Overrides
+You can also explicitly specify pipeline modes or override tensor buffer sizes:
+```bash
+./dump_ane_pmu_objc --coreml path/to/model.mlpackage
+./dump_ane_pmu_objc --mil path/to/model.mil
+./dump_ane_pmu_objc --espresso path/to/model.espresso.net
+./dump_ane_pmu_objc --anecir path/to/ane_bundle
+./dump_ane_pmu_objc --hwx path/to/model.hwx
+./dump_ane_pmu_objc --coreai path/to/model.aimodel --iters 10
+./dump_ane_pmu_objc --in-size 0x24c000 --out-size 0x4000 model.hwx
+```
 
-# Or specify a custom standalone .hwx path
-./dump_ane_pmu_objc resnet50_fp16.aimodel --hwx path/to/model.hwx
+### 3. CoreAI Host JIT Specialization & Inspection
+```bash
+# Specialize .mlirb bytecode into host mpsgraphpackage
+./model_compiler_objc resnet50_fp16.aimodel/main.mlirb resnet50_fp16.aimodel/output_host_jit
+
+# Inspect tensor dimensions and verify silicon loading
+./coreai_loader resnet50_fp16.aimodel
 ```
 
 ---
