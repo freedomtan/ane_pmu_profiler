@@ -601,23 +601,23 @@ To investigate whether Apple doubled physical multiplier lane density, whether P
 
 | Architectural Metric | ResNet-50 (M1 `h13g`) | ResNet-50 (M4 `h16g`) | MobileNetV2 (M1 `h13g`) | MobileNetV2 (M4 `h16g`) |
 | :--- | :---: | :---: | :---: | :---: |
-| **Theoretical Workload (MACs)** | $4.12\text{ Billion}$ | $4.12\text{ Billion}$ | $300\text{ Million}$ | $300\text{ Million}$ |
-| **Warm-up Latency** | $7.51\text{ ms}$ | $2.97\text{ ms}$ | $2.88\text{ ms}$ | $0.90\text{ ms}$ |
-| **Steady-State Inference Latency** | **$2.068\text{ ms}$** ($483.6\text{ FPS}$) | **$1.288\text{ ms}$** ($776.5\text{ FPS}$) | **$0.876\text{ ms}$** ($1{,}141.1\text{ FPS}$) | **$0.561\text{ ms}$** ($1{,}783.0\text{ FPS}$) |
-| **Latency Speedup (M1 / M4)** | \multicolumn{2}{c|}{\textbf{$1.61\times$ ($37.7\%$ faster)}} | \multicolumn{2}{c|}{\textbf{$1.56\times$ ($36.0\%$ faster)}} |
-| **Effective Clock per Core** | **$1.43\text{ GHz}$** | **$2.22\text{ GHz}$** ($+55.2\%$) | **$1.51\text{ GHz}$** | **$2.33\text{ GHz}$** ($+54.3\%$) |
-| **Aggregate Clock (16 Cores)** | $22.87\text{ GHz}$ | $35.57\text{ GHz}$ | $24.16\text{ GHz}$ | $37.35\text{ GHz}$ |
-| **Thermal Throttle Cycles (`[11]`)**| $929\text{ cycles}$ | $144\text{ cycles}$ ($6.45\times$ less) | $616\text{ cycles}$ | $792\text{ cycles}$ |
-| **Convolution Cycles (`[13]`)** | **$6{,}598{,}489\text{ cycles}$** | **$3{,}587{,}649\text{ cycles}$** | **$2{,}526{,}970\text{ cycles}$** | **$2{,}977{,}893\text{ cycles}$** |
-| **Compute Cycle Ratio (M1 / M4)**| \multicolumn{2}{c|}{\textbf{$1.84\times$ (M4 takes FEWER)}} | \multicolumn{2}{c|}{\textbf{$0.85\times$ (M4 takes MORE!)}} |
-| **Sustained MACs / Cycle (Chip)** | **$624.4\text{ MACs/cyc}$** | **$1{,}148.4\text{ MACs/cyc}$** | **$118.7\text{ MACs/cyc}$** | **$100.7\text{ MACs/cyc}$** |
-| **Sustained MACs / Cycle / Core** | $39.0\text{ MACs/cyc/core}$ | $71.8\text{ MACs/cyc/core}$ | $7.4\text{ MACs/cyc/core}$ | $6.3\text{ MACs/cyc/core}$ |
-| **Planar Engine Cycles (`[21]`)** | $0$ (unhooked) | **$963{,}072\text{ cycles}$** | $0$ (unhooked) | **$139{,}568\text{ cycles}$** |
-| **L2PE Input Stalls (`[22]`)** | $0$ (unhooked) | **$937{,}952\text{ cycles}$** | $0$ (unhooked) | **$127{,}776\text{ cycles}$** |
-| **Input Starvation Stalls (`[14]`)**| **$1{,}021{,}325\text{ cycles}$** | **$61{,}771\text{ cycles}$** | **$247{,}526\text{ cycles}$** | **$355{,}633\text{ cycles}$** |
-| **Output Flush Stalls (`[15]`)** | **$1{,}588{,}918\text{ cycles}$** | **$3{,}509{,}481\text{ cycles}$** | **$46{,}779\text{ cycles}$** | **$6{,}340\text{ cycles}$** |
-| **Unified DRAM Read (`[18]`)** | $884{,}576\text{ bytes}$ | $270{,}377\text{ bytes}$ ($3.27\times$ drop) | $127{,}440\text{ bytes}$ | $13{,}714\text{ bytes}$ ($9.3\times$ drop) |
-| **Unified DRAM Read/Write (`[17]`)**| $928{,}512\text{ bytes}$ | $2{,}162{,}077\text{ bytes}$ | $140{,}016\text{ bytes}$ | $985{,}610\text{ bytes}$ |
+| **Theoretical Workload (MACs)** | 4.12 Billion | 4.12 Billion | 300 Million | 300 Million |
+| **Warm-up Latency** | 7.51 ms | 2.97 ms | 2.88 ms | 0.90 ms |
+| **Steady-State Inference Latency** | **2.068 ms** (483.6 FPS) | **1.288 ms** (776.5 FPS) | **0.876 ms** (1,141.1 FPS) | **0.561 ms** (1,783.0 FPS) |
+| **Latency Speedup (M1 vs. M4)** | Baseline (1.00x) | **1.61x** (37.7% faster) | Baseline (1.00x) | **1.56x** (36.0% faster) |
+| **Effective Clock per Core** | **1.43 GHz** | **2.22 GHz** (+55.2%) | **1.51 GHz** | **2.33 GHz** (+54.3%) |
+| **Aggregate Clock (16 Cores)** | 22.87 GHz | 35.57 GHz | 24.16 GHz | 37.35 GHz |
+| **Thermal Throttle Cycles (`[11]`)**| 929 cycles | 144 cycles (6.45x less) | 616 cycles | 792 cycles |
+| **Convolution Cycles (`[13]`)** | **6,598,489 cycles** | **3,587,649 cycles** | **2,526,970 cycles** | **2,977,893 cycles** |
+| **Compute Cycle Ratio (M1 vs. M4)**| Baseline (1.00x) | **1.84x fewer cycles** | Baseline (1.00x) | **0.85x (takes 17.8% more)** |
+| **Sustained MACs / Cycle (Chip)** | **624.4 MACs/cyc** | **1,148.4 MACs/cyc** | **118.7 MACs/cyc** | **100.7 MACs/cyc** |
+| **Sustained MACs / Cycle / Core** | 39.0 MACs/cyc/core | 71.8 MACs/cyc/core | 7.4 MACs/cyc/core | 6.3 MACs/cyc/core |
+| **Planar Engine Cycles (`[21]`)** | 0 (unhooked) | **963,072 cycles** | 0 (unhooked) | **139,568 cycles** |
+| **L2PE Input Stalls (`[22]`)** | 0 (unhooked) | **937,952 cycles** | 0 (unhooked) | **127,776 cycles** |
+| **Input Starvation Stalls (`[14]`)**| **1,021,325 cycles** | **61,771 cycles** | **247,526 cycles** | **355,633 cycles** |
+| **Output Flush Stalls (`[15]`)** | **1,588,918 cycles** | **3,509,481 cycles** | **46,779 cycles** | **6,340 cycles** |
+| **Unified DRAM Read (`[18]`)** | 884,576 bytes | 270,377 bytes (3.27x drop) | 127,440 bytes | 13,714 bytes (9.3x drop) |
+| **Unified DRAM Read/Write (`[17]`)**| 928,512 bytes | 2,162,077 bytes | 140,016 bytes | 985,610 bytes |
 
 ---
 
