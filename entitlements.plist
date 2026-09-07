@@ -4,5 +4,11 @@
 <dict>
     <key>com.apple.ane.hardware-counters</key>
     <true/>
+    <key>com.apple.developer.ane.increased-model-size-limit</key>
+    <true/>
+    <key>com.apple.aned.private.allow</key>
+    <true/>
+    <key>com.apple.aned.private.adapterWeight.allow</key>
+    <true/>
 </dict>
 </plist>
