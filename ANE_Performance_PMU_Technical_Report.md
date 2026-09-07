@@ -222,32 +222,109 @@ IOSurfaceUnlock(pmuSurface, 0, NULL);
 
 ---
 
-### 2.2 Private Framework Wrapper Classes
+### 2.2 Private Framework Reversed Class Interfaces
 
-Accessing the ANE daemon (`aned`) requires dynamic invocation of private classes in `AppleNeuralEngine.framework`:
+Rather than relying on runtime reflection (`objc_getClass`, `NSSelectorFromString`, and `objc_msgSend`), the private classes from `AppleNeuralEngine.framework` are declared directly with their reversed Objective-C interfaces:
 
 ```objc
-Class ioObjCls       = objc_getClass("_ANEIOSurfaceObject");
-Class perfSurfaceCls = objc_getClass("_ANEPerformanceStatsIOSurface");
-Class reqCls         = objc_getClass("_ANERequest");
-Class clientCls      = objc_getClass("_ANEClient");
+@interface _ANEPerformanceStats : NSObject
+@property (nonatomic, readonly) NSData *perfCounterData;
+@property (nonatomic, readonly) unsigned long long hwExecutionTime;
+@property (nonatomic, readonly) NSData *pStatsRawData;
+- (NSDictionary *)performanceCounters;
+- (NSString *)stringForPerfCounter:(int32_t)counter;
+@end
 
-// 1. Wrap raw IOSurface in ANE memory object
-SEL selIoObj = NSSelectorFromString(@"objectWithIOSurface:");
-id pmuIoObj = ((id (*)(id, SEL, id))objc_msgSend)(ioObjCls, selIoObj, (__bridge id)pmuSurface);
+@interface _ANEIOSurfaceObject : NSObject
+@property (nonatomic, readonly) IOSurfaceRef ioSurface;
+@property (nonatomic, readonly, nullable) NSNumber *startOffset;
++ (instancetype)objectWithIOSurface:(IOSurfaceRef)ioSurface;
++ (instancetype)objectWithIOSurface:(IOSurfaceRef)ioSurface startOffset:(nullable NSNumber *)startOffset;
+@end
+
+@interface _ANEPerformanceStatsIOSurface : NSObject
+@property (nonatomic, readonly) _ANEIOSurfaceObject *stats;
+@property (nonatomic, readonly) NSInteger statType;
++ (instancetype)objectWithIOSurface:(_ANEIOSurfaceObject *)surface statType:(NSInteger)statType;
+- (instancetype)initWithIOSurface:(_ANEIOSurfaceObject *)surface statType:(NSInteger)statType;
+@end
+
+@interface _ANERequest : NSObject
+@property (nonatomic, readonly) NSArray<_ANEIOSurfaceObject *> *inputArray;
+@property (nonatomic, readonly) NSArray<NSNumber *> *inputIndexArray;
+@property (nonatomic, readonly) NSArray<_ANEIOSurfaceObject *> *outputArray;
+@property (nonatomic, readonly) NSArray<NSNumber *> *outputIndexArray;
+@property (nonatomic, readonly) NSArray<_ANEPerformanceStatsIOSurface *> *perfStatsArray;
+@property (nonatomic, readonly) NSNumber *procedureIndex;
+@property (nonatomic, strong, nullable) _ANEPerformanceStats *perfStats;
++ (instancetype)requestWithInputs:(NSArray<_ANEIOSurfaceObject *> *)inputs
+                     inputIndices:(NSArray<NSNumber *> *)inputIndices
+                          outputs:(NSArray<_ANEIOSurfaceObject *> *)outputs
+                    outputIndices:(NSArray<NSNumber *> *)outputIndices
+                        perfStats:(nullable NSArray<_ANEPerformanceStatsIOSurface *> *)perfStats
+                   procedureIndex:(NSNumber *)procedureIndex;
+- (BOOL)validate;
+@end
+
+@interface _ANEClient : NSObject
++ (instancetype)sharedConnection;
+- (BOOL)compileModel:(_ANEModel *)model
+             options:(NSDictionary *)options
+                 qos:(unsigned int)qos
+               error:(NSError **)error;
+- (BOOL)loadModel:(_ANEModel *)model
+          options:(NSDictionary *)options
+              qos:(unsigned int)qos
+            error:(NSError **)error;
+- (BOOL)unloadModel:(_ANEModel *)model
+            options:(NSDictionary *)options
+                qos:(unsigned int)qos
+              error:(NSError **)error;
+- (BOOL)evaluateWithModel:(_ANEModel *)model
+                  options:(NSDictionary *)options
+                  request:(_ANERequest *)request
+                      qos:(unsigned int)qos
+                    error:(NSError **)error;
+@end
+```
+
+With these declarations, constructing the hardware PMU surface, dispatching live silicon inferences, and reading back PMU counters is expressed in clean, type-safe Objective-C:
+
+```objc
+// 1. Wrap raw IOSurfaces in ANE memory objects
+_ANEIOSurfaceObject *inSurfaceObj  = [_ANEIOSurfaceObject objectWithIOSurface:inSurface];
+_ANEIOSurfaceObject *outSurfaceObj = [_ANEIOSurfaceObject objectWithIOSurface:outSurface];
+_ANEIOSurfaceObject *pmuIoObj      = [_ANEIOSurfaceObject objectWithIOSurface:pmuSurface];
 
 // 2. Wrap as Performance Stats Surface with statType = 2
-SEL selPmuObj = NSSelectorFromString(@"objectWithIOSurface:statType:");
-id pmuSurfaceObj = ((id (*)(id, SEL, id, NSInteger))objc_msgSend)(perfSurfaceCls, selPmuObj, pmuIoObj, 2);
+_ANEPerformanceStatsIOSurface *pmuSurfaceObj = 
+    [_ANEPerformanceStatsIOSurface objectWithIOSurface:pmuIoObj statType:2];
 
 // 3. Construct _ANERequest binding inputs, outputs, and PMU buffer
-SEL selReq = NSSelectorFromString(@"requestWithInputs:inputIndices:outputs:outputIndices:perfStats:procedureIndex:");
-id request = ((id (*)(id, SEL, id, id, id, id, id, id))objc_msgSend)(
-    reqCls, selReq,
-    @[inSurfaceObj],  @[@0],
-    @[outSurfaceObj], @[@0],
-    @[pmuSurfaceObj], @0
-);
+_ANERequest *request = [_ANERequest requestWithInputs:@[inSurfaceObj]
+                                         inputIndices:@[@0]
+                                              outputs:@[outSurfaceObj]
+                                        outputIndices:@[@0]
+                                            perfStats:@[pmuSurfaceObj]
+                                       procedureIndex:@0];
+
+// 4. Dispatch live inference on physical silicon via _ANEClient
+_ANEClient *client = [_ANEClient sharedConnection];
+NSDictionary *evalOpts = @{
+    @"kANEFPerformanceStatsMask": @(15),
+    @"enableProfiling": @YES
+};
+NSError *evalErr = nil;
+BOOL evalOk = [client evaluateWithModel:model
+                                options:evalOpts
+                                request:request
+                                    qos:25
+                                  error:&evalErr];
+
+// 5. Read back decoded hardware counters directly from request.perfStats
+_ANEPerformanceStats *stats = request.perfStats;
+NSDictionary *counters = stats.performanceCounters;
+NSData *rawRegData = stats.perfCounterData;
 ```
 
 #### Reverse-Engineering Evidence: `statType = 2` Validation in `AppleNeuralEngine`

@@ -7,6 +7,7 @@
 #define COREAI_LOADER_H
 
 #import <Foundation/Foundation.h>
+#import <IOSurface/IOSurface.h>
 #import <MetalPerformanceShadersGraph/MetalPerformanceShadersGraph.h>
 #import "model_compiler.h"
 
@@ -15,6 +16,18 @@ NS_ASSUME_NONNULL_BEGIN
 #pragma mark - AppleNeuralEngine Private Declarations
 
 @class _ANEModel;
+@class _ANEIOSurfaceObject;
+@class _ANEPerformanceStats;
+@class _ANEPerformanceStatsIOSurface;
+@class _ANERequest;
+
+@interface _ANEPerformanceStats : NSObject
+@property (nonatomic, readonly) NSData *perfCounterData;
+@property (nonatomic, readonly) unsigned long long hwExecutionTime;
+@property (nonatomic, readonly) NSData *pStatsRawData;
+- (NSDictionary *)performanceCounters;
+- (NSString *)stringForPerfCounter:(int32_t)counter;
+@end
 
 @interface _ANEModel : NSObject
 @property (nonatomic, assign) unsigned long long programHandle;
@@ -22,6 +35,37 @@ NS_ASSUME_NONNULL_BEGIN
 @property (nonatomic, readonly) NSURL *modelURL;
 + (nullable instancetype)modelAtURL:(NSURL *)url key:(NSString *)key;
 + (nullable instancetype)modelAtURL:(NSURL *)url key:(NSString *)key mpsConstants:(nullable NSString *)mpsConstants;
+@end
+
+@interface _ANEIOSurfaceObject : NSObject
+@property (nonatomic, readonly) IOSurfaceRef ioSurface;
+@property (nonatomic, readonly, nullable) NSNumber *startOffset;
++ (instancetype)objectWithIOSurface:(IOSurfaceRef)ioSurface;
++ (instancetype)objectWithIOSurface:(IOSurfaceRef)ioSurface startOffset:(nullable NSNumber *)startOffset;
+@end
+
+@interface _ANEPerformanceStatsIOSurface : NSObject
+@property (nonatomic, readonly) _ANEIOSurfaceObject *stats;
+@property (nonatomic, readonly) NSInteger statType;
++ (instancetype)objectWithIOSurface:(_ANEIOSurfaceObject *)surface statType:(NSInteger)statType;
+- (instancetype)initWithIOSurface:(_ANEIOSurfaceObject *)surface statType:(NSInteger)statType;
+@end
+
+@interface _ANERequest : NSObject
+@property (nonatomic, readonly) NSArray<_ANEIOSurfaceObject *> *inputArray;
+@property (nonatomic, readonly) NSArray<NSNumber *> *inputIndexArray;
+@property (nonatomic, readonly) NSArray<_ANEIOSurfaceObject *> *outputArray;
+@property (nonatomic, readonly) NSArray<NSNumber *> *outputIndexArray;
+@property (nonatomic, readonly) NSArray<_ANEPerformanceStatsIOSurface *> *perfStatsArray;
+@property (nonatomic, readonly) NSNumber *procedureIndex;
+@property (nonatomic, strong, nullable) _ANEPerformanceStats *perfStats;
++ (instancetype)requestWithInputs:(NSArray<_ANEIOSurfaceObject *> *)inputs
+                     inputIndices:(NSArray<NSNumber *> *)inputIndices
+                          outputs:(NSArray<_ANEIOSurfaceObject *> *)outputs
+                    outputIndices:(NSArray<NSNumber *> *)outputIndices
+                        perfStats:(nullable NSArray<_ANEPerformanceStatsIOSurface *> *)perfStats
+                   procedureIndex:(NSNumber *)procedureIndex;
+- (BOOL)validate;
 @end
 
 @interface _ANEClient : NSObject
@@ -38,6 +82,11 @@ NS_ASSUME_NONNULL_BEGIN
             options:(NSDictionary *)options
                 qos:(unsigned int)qos
               error:(NSError **)error;
+- (BOOL)evaluateWithModel:(_ANEModel *)model
+                  options:(NSDictionary *)options
+                  request:(_ANERequest *)request
+                      qos:(unsigned int)qos
+                    error:(NSError **)error;
 @end
 
 #pragma mark - MetalPerformanceShadersGraph Private Declarations

@@ -47,7 +47,7 @@ typedef struct {
 static IOSurfaceRef gInSurface = NULL;
 static IOSurfaceRef gOutSurface = NULL;
 static IOSurfaceRef gPmuSurface = NULL;
-static id gLivePerfStatsObj = nil;
+static _ANEPerformanceStats *gLivePerfStatsObj = nil;
 static uint64_t gLiveHwTimeNs = 0;
 static uint64_t gInitialRegs[29] = { 0 };
 static uint64_t gFinalRegs[29] = { 0 };
@@ -162,24 +162,13 @@ BOOL runLiveInferenceAndCapturePmu(const Config *cfg) {
         return NO;
     }
 
-    Class clientCls      = NSClassFromString(@"_ANEClient");
-    Class modelCls       = NSClassFromString(@"_ANEModel");
-    Class reqCls         = NSClassFromString(@"_ANERequest");
-    Class ioObjCls       = NSClassFromString(@"_ANEIOSurfaceObject");
-    Class perfSurfaceCls = NSClassFromString(@"_ANEPerformanceStatsIOSurface");
-
-    if (!clientCls || !modelCls || !reqCls || !ioObjCls || !perfSurfaceCls) {
-        fprintf(stderr, "❌ Required ANE classes not found in runtime.\n");
-        return NO;
-    }
-
     if (![[NSFileManager defaultManager] fileExistsAtPath:cfg->modelPath]) {
         printf("❌ Model file not found at path: %s\n", cfg->modelPath.UTF8String);
         return NO;
     }
 
-    id client = nil;
-    id model = nil;
+    _ANEClient *client = nil;
+    _ANEModel *model = nil;
     size_t inBytes = cfg->inBytes;
     size_t outBytes = cfg->outBytes;
 
@@ -212,7 +201,7 @@ BOOL runLiveInferenceAndCapturePmu(const Config *cfg) {
         printf("  • Output Buffer Size       : %zu bytes (auto-configured)\n", outBytes);
     } else {
         // 1. Connect to ANE Daemon
-        client = [clientCls valueForKey:@"sharedConnection"];
+        client = [_ANEClient sharedConnection];
         printf("⚡️ DISPATCHING LIVE INFERENCE ON PHYSICAL ANE SILICON...\n");
         printf("  • Execution Pipeline       : %s\n", cfg->runMode == RUN_MODE_COMPILE ? "_ANEClient JIT Compilation" : "Pre-Compiled .hwx Execution");
         printf("  • Model File Path          : %s\n", cfg->modelPath.UTF8String);
@@ -220,22 +209,17 @@ BOOL runLiveInferenceAndCapturePmu(const Config *cfg) {
 
         // 2. Wrap model in _ANEModel
         NSURL *modelURL = [NSURL fileURLWithPath:cfg->modelPath];
-        SEL selModel = NSSelectorFromString(@"modelAtURL:key:");
-        typedef id (*ModelFn)(id, SEL, NSURL *, NSString *);
-        model = ((ModelFn)objc_msgSend)(modelCls, selModel, modelURL, @"net");
+        model = [_ANEModel modelAtURL:modelURL key:@"net"];
 
-        // 3. Optional Step: Option A Compilation
+        // 3. Optional Step: CoreML Compilation
         if (cfg->runMode == RUN_MODE_COMPILE) {
-            printf("  • Option A Compiling via   : aned daemon (kANEFModelMIL)... \n");
-            SEL selCompile = NSSelectorFromString(@"compileModel:options:qos:error:");
-            typedef BOOL (*CompileFn)(id, SEL, id, NSDictionary *, unsigned int, NSError **);
-
+            printf("  • CoreML Compiling via     : aned daemon (kANEFModelMIL)... \n");
             NSError *compErr = nil;
             NSDictionary *compOpts = @{
                 kANEFModelTypeKey: @"kANEFModelMIL"
             };
             uint64_t tComp0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
-            BOOL compOk = ((CompileFn)objc_msgSend)(client, selCompile, model, compOpts, 25, &compErr);
+            BOOL compOk = [client compileModel:model options:compOpts qos:25 error:&compErr];
             uint64_t dtComp = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - tComp0;
 
             if (!compOk) {
@@ -243,20 +227,17 @@ BOOL runLiveInferenceAndCapturePmu(const Config *cfg) {
                 return NO;
             }
             printf("  • Compilation Latency      : %.2f ms (Cache Identifier: %s)\n",
-                   (double)dtComp / 1000000.0, [[model valueForKey:@"cacheURLIdentifier"] UTF8String]);
+                   (double)dtComp / 1000000.0, model.cacheURLIdentifier.UTF8String ?: "unknown");
         }
 
         // 4. Load Model into Silicon
-        SEL selLoad = NSSelectorFromString(@"loadModel:options:qos:error:");
-        typedef BOOL (*LoadFn)(id, SEL, id, NSDictionary *, unsigned int, NSError **);
-
         NSError *loadErr = nil;
         NSDictionary *loadOpts = @{
             kANEFModelTypeKey: (cfg->runMode == RUN_MODE_COMPILE) ? @"kANEFModelMIL" : kANEFModelPreCompiledValue,
             kANEFPerformanceStatsMaskKey: @(15)
         };
 
-        BOOL loadOk = ((LoadFn)objc_msgSend)(client, selLoad, model, loadOpts, 25, &loadErr);
+        BOOL loadOk = [client loadModel:model options:loadOpts qos:25 error:&loadErr];
         if (!loadOk) {
             printf("❌ Failed to load model into ANE silicon: %s\n", loadErr.description.UTF8String ?: "Unknown error");
             return NO;
@@ -276,9 +257,7 @@ BOOL runLiveInferenceAndCapturePmu(const Config *cfg) {
         (id)kIOSurfaceAllocSize: @(inBytes)
     };
     gInSurface = IOSurfaceCreate((CFDictionaryRef)inProps);
-    SEL selIoObj = NSSelectorFromString(@"objectWithIOSurface:");
-    typedef id (*IoObjFn)(id, SEL, id);
-    id inSurfaceObj = ((IoObjFn)objc_msgSend)(ioObjCls, selIoObj, (__bridge id)gInSurface);
+    _ANEIOSurfaceObject *inSurfaceObj = [_ANEIOSurfaceObject objectWithIOSurface:gInSurface];
 
     // 6. Create Output IOSurface
     NSDictionary *outProps = @{
@@ -289,7 +268,7 @@ BOOL runLiveInferenceAndCapturePmu(const Config *cfg) {
         (id)kIOSurfaceAllocSize: @(outBytes)
     };
     gOutSurface = IOSurfaceCreate((CFDictionaryRef)outProps);
-    id outSurfaceObj = ((IoObjFn)objc_msgSend)(ioObjCls, selIoObj, (__bridge id)gOutSurface);
+    _ANEIOSurfaceObject *outSurfaceObj = [_ANEIOSurfaceObject objectWithIOSurface:gOutSurface];
 
     // 7. Create PMU Stats IOSurface (statType = 2, 4096 bytes)
     NSDictionary *pmuProps = @{
@@ -304,23 +283,18 @@ BOOL runLiveInferenceAndCapturePmu(const Config *cfg) {
     memset(IOSurfaceGetBaseAddress(gPmuSurface), 0, 4096);
     IOSurfaceUnlock(gPmuSurface, 0, NULL);
 
-    id pmuIoObj = ((IoObjFn)objc_msgSend)(ioObjCls, selIoObj, (__bridge id)gPmuSurface);
-    SEL selPmuObj = NSSelectorFromString(@"objectWithIOSurface:statType:");
-    typedef id (*PmuObjFn)(id, SEL, id, NSInteger);
-    id pmuSurfaceObj = ((PmuObjFn)objc_msgSend)(perfSurfaceCls, selPmuObj, pmuIoObj, 2);
+    _ANEIOSurfaceObject *pmuIoObj = [_ANEIOSurfaceObject objectWithIOSurface:gPmuSurface];
+    _ANEPerformanceStatsIOSurface *pmuSurfaceObj = [_ANEPerformanceStatsIOSurface objectWithIOSurface:pmuIoObj statType:2];
 
     // 8. Assemble _ANERequest with perfStats surface
-    SEL selReq = NSSelectorFromString(@"requestWithInputs:inputIndices:outputs:outputIndices:perfStats:procedureIndex:");
-    typedef id (*ReqFn)(id, SEL, NSArray *, NSArray *, NSArray *, NSArray *, NSArray *, NSNumber *);
-    id request = ((ReqFn)objc_msgSend)(reqCls, selReq,
-                                       @[inSurfaceObj], @[@0],
-                                       @[outSurfaceObj], @[@0],
-                                       @[pmuSurfaceObj], @0);
+    _ANERequest *request = [_ANERequest requestWithInputs:@[inSurfaceObj]
+                                             inputIndices:@[@0]
+                                                  outputs:@[outSurfaceObj]
+                                            outputIndices:@[@0]
+                                                perfStats:@[pmuSurfaceObj]
+                                           procedureIndex:@0];
 
     // 9. Run live silicon inferences
-    SEL selEval = NSSelectorFromString(@"evaluateWithModel:options:request:qos:error:");
-    typedef BOOL (*EvalFn)(id, SEL, id, NSDictionary *, id, unsigned int, NSError **);
-
     NSDictionary *evalOpts = @{
         kANEFPerformanceStatsMaskKey: @(15),
         @"enableProfiling": @YES
@@ -329,14 +303,14 @@ BOOL runLiveInferenceAndCapturePmu(const Config *cfg) {
     printf("🔥 Performing warm-up iteration & establishing baseline PMU counters...\n");
     NSError *warmupErr = nil;
     uint64_t tW0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
-    BOOL warmupOk = ((EvalFn)objc_msgSend)(client, selEval, model, evalOpts, request, 25, &warmupErr);
+    BOOL warmupOk = [client evaluateWithModel:model options:evalOpts request:request qos:25 error:&warmupErr];
     uint64_t dtWarmup = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - tW0;
     if (warmupOk) {
         printf("  • Warm-up Completed in     : %9.2f µs (%.3f ms)\n",
                (double)dtWarmup / 1000.0, (double)dtWarmup / 1000000.0);
-        id wStats = [request valueForKey:@"perfStats"];
+        _ANEPerformanceStats *wStats = request.perfStats;
         if (wStats) {
-            NSData *wData = [wStats valueForKey:@"perfCounterData"];
+            NSData *wData = wStats.perfCounterData;
             if (wData && wData.length >= sizeof(gInitialRegs)) {
                 memcpy(gInitialRegs, wData.bytes, sizeof(gInitialRegs));
                 gHasInitialRegs = YES;
@@ -353,7 +327,7 @@ BOOL runLiveInferenceAndCapturePmu(const Config *cfg) {
     for (int i = 0; i < cfg->numIters; i++) {
         NSError *evalErr = nil;
         uint64_t t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
-        BOOL ok = ((EvalFn)objc_msgSend)(client, selEval, model, evalOpts, request, 25, &evalErr);
+        BOOL ok = [client evaluateWithModel:model options:evalOpts request:request qos:25 error:&evalErr];
         uint64_t dt = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0;
         totalNs += dt;
 
@@ -362,7 +336,7 @@ BOOL runLiveInferenceAndCapturePmu(const Config *cfg) {
             return NO;
         }
 
-        id retPerfStats = [request valueForKey:@"perfStats"];
+        _ANEPerformanceStats *retPerfStats = request.perfStats;
         if (retPerfStats) {
             gLivePerfStatsObj = retPerfStats;
         }
@@ -371,7 +345,7 @@ BOOL runLiveInferenceAndCapturePmu(const Config *cfg) {
     }
 
     if (gLivePerfStatsObj) {
-        NSData *fData = [gLivePerfStatsObj valueForKey:@"perfCounterData"];
+        NSData *fData = gLivePerfStatsObj.perfCounterData;
         if (fData && fData.length >= sizeof(gFinalRegs)) {
             memcpy(gFinalRegs, fData.bytes, sizeof(gFinalRegs));
         }
@@ -392,9 +366,8 @@ void decodeAndDumpPmuRegisters(BOOL isUnlocked) {
         return;
     }
 
-    Class statsCls = [gLivePerfStatsObj class];
-    NSDictionary *counters = [gLivePerfStatsObj valueForKey:@"performanceCounters"];
-    NSData *rawPerfData = [gLivePerfStatsObj valueForKey:@"perfCounterData"];
+    NSDictionary *counters = gLivePerfStatsObj.performanceCounters;
+    NSData *rawPerfData = gLivePerfStatsObj.perfCounterData;
     const uint64_t *rawRegs = (const uint64_t *)rawPerfData.bytes;
     size_t numRegs = rawPerfData.length / sizeof(uint64_t);
 
@@ -446,10 +419,6 @@ void decodeAndDumpPmuRegisters(BOOL isUnlocked) {
     }
     printf("----------------------------------------------------------------------------------------------------------------------------------\n\n");
 
-    SEL selName = NSSelectorFromString(@"stringForPerfCounter:");
-    typedef NSString * (*NameFn)(id, SEL, int32_t);
-    NameFn nameFn = (NameFn)[statsCls instanceMethodForSelector:selName];
-
     printf("📋 COMPLETE 29 SILICON PMU REGISTERS & DELTAS TABLE:\n");
     printf("----------------------------------------------------------------------------------------------------------------------------------\n");
     printf("%-6s | %-28s | %-16s | %-16s | %-18s | %s\n",
@@ -457,7 +426,7 @@ void decodeAndDumpPmuRegisters(BOOL isUnlocked) {
     printf("----------------------------------------------------------------------------------------------------------------------------------\n");
 
     for (int32_t i = 0; i < 29; i++) {
-        NSString *regName = nameFn(gLivePerfStatsObj, selName, i);
+        NSString *regName = [gLivePerfStatsObj stringForPerfCounter:i];
         NSNumber *val = counters[regName];
         uint64_t v = 0;
         if (val) {
