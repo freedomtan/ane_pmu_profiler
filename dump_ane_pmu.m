@@ -402,18 +402,18 @@ void decodeAndDumpPmuRegisters(BOOL isUnlocked) {
 
         printf("----------------------------------------------------------------------------------------------------------------------------------\n");
         printf("📈 SILICON PMU DELTA HIGHLIGHTS (Per-Inference Activity):\n");
-        printf("  • NE Compute Cycles        : %s cycles/iter  (kANE_NE_COMPUTE_CYCLES)\n",
+        printf("  • Neural Engine Compute Cycles : %s cycles/iter  (kANE_NE_COMPUTE_CYCLES)\n",
                [numFmt stringFromNumber:@(neCompPerIter)].UTF8String);
-        printf("  • L2PE Compute Cycles      : %s cycles/iter  (kANE_L2PE_COMPUTE_CYCLES)\n",
+        printf("  • L2PE Compute Cycles          : %s cycles/iter  (kANE_L2PE_COMPUTE_CYCLES)\n",
                [numFmt stringFromNumber:@(l2pePerIter)].UTF8String);
-        printf("  • NE Nominal Cycles        : %s cycles/iter  (kANE_NE_NOMINAL_CYCLES)\n",
+        printf("  • Neural Engine Nominal Cycles : %s cycles/iter  (kANE_NE_NOMINAL_CYCLES)\n",
                [numFmt stringFromNumber:@(neNomPerIter)].UTF8String);
-        printf("  • Unified Memory Read/Write: %s bytes/iter   (kANE_DMA_READWRITE_BYTES)\n",
+        printf("  • Unified Memory Read/Write    : %s bytes/iter   (kANE_DMA_READWRITE_BYTES)\n",
                [numFmt stringFromNumber:@(dmaRwPerIter)].UTF8String);
-        printf("  • Unified Memory DMA Read  : %s bytes/iter   (kANE_DMA_READ_BYTES)\n",
+        printf("  • Unified Memory DMA Read      : %s bytes/iter   (kANE_DMA_READ_BYTES)\n",
                [numFmt stringFromNumber:@(dmaRPerIter)].UTF8String);
         if (effClkGhz > 0.0) {
-            printf("  • Effective Silicon Clock  : %.2f GHz per core (%.2f GHz aggregate across 16 cores)\n",
+            printf("  • Effective Silicon Clock      : %.2f GHz per core (%.2f GHz aggregate across 16 cores)\n",
                    effClkGhz / 16.0, effClkGhz);
         }
     }
@@ -444,11 +444,11 @@ void decodeAndDumpPmuRegisters(BOOL isUnlocked) {
 
         const char *subsystem = "Reserved / Internal";
         if (i <= 4) subsystem = "On-Chip L2 SRAM Bus";
-        else if (i <= 6) subsystem = "Compute Unit (Tensor Cores)";
+        else if (i <= 6) subsystem = "Neural Engine (Convolution Engine)";
         else if (i <= 9) subsystem = "Pipeline Stall Detection";
-        else if (i == 10) subsystem = "Compute Unit (Tensor Cores)";
+        else if (i == 10) subsystem = "Neural Engine (Clock / Baseline)";
         else if (i <= 12) subsystem = "Power & Thermal Management";
-        else if (i == 13) subsystem = "Compute Unit (Tensor Cores)";
+        else if (i == 13) subsystem = "Neural Engine (Convolution Engine)";
         else if (i <= 16) subsystem = "Pipeline Stall Detection";
         else if (i <= 18) subsystem = "Unified Memory DMA Bus";
         else if (i == 19) subsystem = "Power & Thermal Management";

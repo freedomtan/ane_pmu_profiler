@@ -21,7 +21,7 @@ Historically, this hardware PMU telemetry has been locked down by kernel driver 
 
 On Apple Silicon (e.g., Apple H16g / M4), the ANE subsystem comprises:
 - **16 Physical Cores**: Operating at dynamic DVFS clock frequencies up to $\approx 2.42\text{ GHz}$.
-- **Neural Engine (NE) Convolution Core**: Wide convolution Multiply-Accumulate (MAC) engine specialized for dense tensor operations and 2D/3D convolutions.
+- **Neural Engine Convolution Engine**: Wide convolution Multiply-Accumulate (MAC) engine specialized for dense tensor operations and 2D/3D convolutions, as specified in Apple patents.
 - **Planar Engine (PE / L2PE)**: Wide vector execution ALU handling non-linear activations (ReLU, GeLU), element-wise tensor additions, pooling, and quantization scalers.
 - **On-Chip L2 SRAM**: High-bandwidth local scratchpad SRAM acting as an activation cache and weight buffer.
 - **Unified Memory DMA Controller**: Direct Memory Access channels streaming tensors between unified system RAM (LPDDR5X) and on-chip SRAM.
@@ -30,10 +30,10 @@ On Apple Silicon (e.g., Apple H16g / M4), the ANE subsystem comprises:
        +-------------------------------------------------------------+
        |               Apple Neural Engine Subsystem                 |
        |                                                             |
-       |  +------------------+             +----------------------+  |
-       |  |  NE Tensor Core  |<----------->|    On-Chip L2 SRAM   |  |
-       |  |(Convolution MACs)|             |     (Weight/Act)     |  |
-       |  +------------------+             +----------------------+  |
+       |  +--------------------+             +--------------------+  |
+       |  | Convolution Engine |<----------->|  On-Chip L2 SRAM   |  |
+       |  |   (Neural Engine)  |             |    (Weight/Act)    |  |
+       |  +--------------------+             +--------------------+  |
        |           |                                  ^              |
        |           v                                  |              |
        |  +------------------+                        |              |
@@ -439,28 +439,47 @@ Reading the string pointer array at `0x1e126f748` maps out the first 24 hardware
 | `[00]` | `kANE_AF_TO_L2_DATA` | On-Chip L2 SRAM Bus | Activation Fabric to L2 cache data transfers |
 | `[01]` | `kANE_AF_TO_KM_DATA` | On-Chip L2 SRAM Bus | Activation Fabric to Kernel Memory transfers |
 | `[02]` | `kANE_L2_TO_AF_DATA` | On-Chip L2 SRAM Bus | L2 Cache to Activation Fabric read transfers |
-| `[03]` | `kANE_L2_TO_NE_DATA` | On-Chip L2 SRAM Bus | L2 Cache to Neural Engine core read transfers |
-| `[04]` | `kANE_NE_TO_L2_DATA` | On-Chip L2 SRAM Bus | Neural Engine core write-backs to L2 cache |
-| `[05]` | `kANE_INT8_CYCLES` | Compute Unit (Legacy) | Static legacy counter on H16 (`816`) |
-| `[06]` | `kANE_FP16_CYCLES:` | Compute Unit (Legacy) | Legacy counter (reports 0 on H16) |
+| `[03]` | `kANE_L2_TO_NE_DATA` | On-Chip L2 SRAM Bus | L2 Cache to Neural Engine convolution engine transfers |
+| `[04]` | `kANE_NE_TO_L2_DATA` | On-Chip L2 SRAM Bus | Neural Engine convolution engine write-backs to L2 cache |
+| `[05]` | `kANE_INT8_CYCLES` | Neural Engine (Legacy) | Static legacy counter on H16 (`816`) |
+| `[06]` | `kANE_FP16_CYCLES:` | Neural Engine (Legacy) | Legacy counter (reports 0 on H16) |
 | `[07]` | `kANE_L2_READ_STALL_CYCLES` | Pipeline Stall Detection | L2 memory read pipeline wait cycles |
 | `[08]` | `kANE_L2_WRITE_STALL_CYCLES`| Pipeline Stall Detection | L2 memory write buffer full stalls |
 | `[09]` | `kANE_KM_STALL_CYCLES` | Pipeline Stall Detection | Kernel memory interface stall cycles |
-| `[10]` | `kANE_NE_NOMINAL_CYCLES` | Compute Unit (Clock) | Aggregate nominal clock cycles across all 16 cores |
+| `[10]` | `kANE_NE_NOMINAL_CYCLES` | Neural Engine (Clock) | Aggregate nominal clock cycles across all 16 cores |
 | `[11]` | `kANE_NE_THROTTLE_CYCLES` | Power & Thermal Management| DVFS thermal and power throttling cycles |
 | `[12]` | `kANE_L2_THROTTLE_CYCLES` | Power & Thermal Management| L2 SRAM bandwidth throttle cycles |
-| `[13]` | `kANE_NE_COMPUTE_CYCLES` | Compute Unit (Tensor Core) | **Active tensor matrix compute cycles (FP16 & INT8)** |
-| `[14]` | `kANE_NE_INPUT_STALL_CYCLES`| Pipeline Stall Detection | Matrix array input operand starvation stall cycles |
-| `[15]` | `kANE_NE_OUTPUT_STALL_CYCLES`| Pipeline Stall Detection| Matrix array output accumulation backpressure |
+| `[13]` | `kANE_NE_COMPUTE_CYCLES` | Neural Engine (Convolution Engine) | **Active Neural Engine convolution compute cycles (FP16 & INT8)** |
+| `[14]` | `kANE_NE_INPUT_STALL_CYCLES`| Pipeline Stall Detection | Convolution engine input operand starvation stall cycles |
+| `[15]` | `kANE_NE_OUTPUT_STALL_CYCLES`| Pipeline Stall Detection| Convolution engine output accumulation backpressure |
 | `[16]` | `kANE_NE_KERNEL_STALL_CYCLES`| Pipeline Stall Detection| Weight / kernel coefficient fetch stalls |
 | `[17]` | `kANE_DMA_READWRITE_BYTES` | Unified Memory DMA Bus | **Total bytes transferred between Unified RAM and ANE** |
 | `[18]` | `kANE_DMA_READ_BYTES` | Unified Memory DMA Bus | **Bytes read from Unified RAM (Input tensors)** |
 | `[19]` | `kANE_DPE_ENERGY` | Power & Thermal Management| **Silicon dynamic energy consumption metric** |
 | `[20]` | `kANE_L2_NOMINAL_CYCLES` | On-Chip L2 SRAM Bus | L2 controller operational nominal cycles |
-| `[21]` | `kANE_L2PE_COMPUTE_CYCLES` | Planar Engine (Vector PE) | **Active vector ALU compute cycles (ReLU, Add, Pool)**|
-| `[22]` | `kANE_L2PE_INPUT_STALL_CYCLES`| Planar Engine (Vector PE)| Planar Engine vector operand starvation stalls |
+| `[21]` | `kANE_L2PE_COMPUTE_CYCLES` | Planar Engine (PE / L2PE) | **Active vector ALU compute cycles (ReLU, Add, Pool)**|
+| `[22]` | `kANE_L2PE_INPUT_STALL_CYCLES`| Planar Engine (PE / L2PE)| Planar Engine vector operand starvation stalls |
 | `[23]` | `kANE_L2PE_OUTPUT_STALL_CYCLES`| Planar Engine (Vector PE)| Planar Engine result write-back stalls |
 | `[24-28]`| `kANE_UKNOWN` | Reserved / Internal | Unmapped internal hardware telemetry lines |
+
+---
+
+### 3.3 Architectural Evolution: M1 (`h13g`) vs. M4 (`h16g`) and Planar Engine PMU Telemetry
+
+#### A. Terminology in Apple Patents
+Apple's patent portfolio (e.g., US Patent 10,956,808 B2, *"Circuitry for Performing Neural Network Computations"*, and US 2021/0097388 A1) establishes the definitive terminology for the accelerator subsystem:
+1. **Neural Engine**: The overarching hardware coprocessor block.
+2. **Convolution Engine**: The matrix execution block within each Neural Engine core consisting of an array of cross-channel processing elements (multipliers and accumulators) designed for multi-channel 2D/3D convolutions and matrix products.
+3. **Planar Engine (PE)**: A specialized vector processor dedicated to post-convolution element-wise operations, activation functions (ReLU, GeLU, Sigmoid), pooling (Max/AvgPool), tensor additions, and quantization scaling.
+
+#### B. Planar Engine Execution in M1 Silicon vs. PMU Hookup
+Empirical verification on physical Apple M1 silicon (`Apple h13g`, board type 64, driver `AppleH11ANEInterface`) reveals an important architectural distinction regarding the Planar Engine:
+- **Planar Engine Presence in M1**:
+  Inspection of compiled M1 `.hwx` binary task descriptors (`td`) confirms that the Planar Engine is actively utilized in M1 workloads. Sub-task descriptors dispatch element-wise and non-linear layers directly to the PE unit.
+- **Why `kANE_L2PE_*` Registers Report 0 on M1**:
+  In M1 (`h13g`), the Planar Engine was architecturally simpler and tightly integrated into the execution datapath. In this first-generation Apple Silicon Neural Engine design, the dedicated `kANE_L2PE_*` telemetry counters (registers `[21]`, `[22]`, and `[23]`) were **not yet hooked up or routed to the hardware PMU accumulator ring buffer**.
+- **Wired L2PE Telemetry in Later Generations**:
+  Starting with subsequent microarchitectures (including Apple `h16g` / M4), Apple decoupled and expanded the Planar Engine into the dedicated L2PE subsystem and wired real-time PMU streaming accumulators directly into the silicon. On M4 silicon, `kANE_L2PE_COMPUTE_CYCLES` registers hundreds of thousands of active vector cycles per inference, enabling clear separation between convolution MAC execution and Planar Engine vector processing.
 
 ---
 
@@ -514,7 +533,7 @@ Measured Silicon Latency      | 1.399 ms (714.9 FPS)   | 0.601 ms (1,663.5 FPS) 
 ### 5.2 Microarchitectural Analysis & Insights
 
 #### A. The Depthwise Convolution Engine Bottleneck
-A major paradox revealed by the PMU data is that while MobileNetV2 requires **$13.7\times$ fewer theoretical operations** than ResNet-50 ($300\text{M}$ vs $4.12\text{B}$ MACs), its tensor engine execution (`kANE_NE_COMPUTE_CYCLES`) takes **nearly the same number of cycles** ($2.98\text{M}$ vs $3.62\text{M}$).
+A major paradox revealed by the PMU data is that while MobileNetV2 requires **$13.7\times$ fewer theoretical operations** than ResNet-50 ($300\text{M}$ vs $4.12\text{B}$ MACs), its Neural Engine convolution engine execution (`kANE_NE_COMPUTE_CYCLES`) takes **nearly the same number of cycles** ($2.98\text{M}$ vs $3.62\text{M}$).
 - **ResNet-50 Sustained Efficiency**:
   $$\frac{4.12 \times 10^9\text{ MACs}}{3.62 \times 10^6\text{ cycles}} \approx \mathbf{1{,}138\text{ MACs / cycle}}$$
 - **MobileNetV2 Sustained Efficiency**:
@@ -542,7 +561,7 @@ The ANE convolution engine (`MACCfg`) is wired with fixed cross-channel multipli
 ---
 
 #### B. Planar Engine (Vector PE) and Memory Stalls
-MobileNetV2 achieves its **$2.33\times$ latency reduction** and **$8.27\times$ energy reduction** through non-tensor hardware units:
+MobileNetV2 achieves its **$2.33\times$ latency reduction** and **$8.27\times$ energy reduction** through non-convolution hardware units (Planar Engine and DMA):
 1. **Planar Engine (PE) Efficiency**: ResNet-50 incurs $963{,}072$ vector cycles across 49 ReLUs and 16 large residual element-wise adds. MobileNetV2 uses *Linear Bottlenecks* (omitting activations on projection layers), requiring only $139{,}568$ vector cycles ($6.9\times$ reduction).
 2. **Elimination of Output Pipeline Stalls**: In ResNet-50, wide intermediate feature maps cause $2{,}268{,}659$ output write stall cycles (`kANE_NE_OUTPUT_STALL_CYCLES`). MobileNetV2's thin bottlenecks fit cleanly within the on-chip L2 SRAM, reducing output stalls to just $5{,}540$ cycles ($400\times$ reduction).
 3. **Weight Cache Residency**: Neither model re-reads its weights from system DRAM during steady-state inference.

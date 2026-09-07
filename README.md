@@ -7,7 +7,7 @@ This repository contains a high-performance, self-contained Objective-C and C to
 ## 1. Features & Highlights
 
 - **Live Physical Silicon PMU Streaming**: Unlocks the kernel driver gate (`AppleH1xANEInterface`) to stream all **29 64-bit hardware PMU registers** per inference, including:
-  - Neural Engine (NE) convolution engine MAC cycles (`kANE_NE_COMPUTE_CYCLES`)
+  - Neural Engine convolution engine MAC cycles (`kANE_NE_COMPUTE_CYCLES`)
   - Planar Engine (PE / L2PE) vector cycles (`kANE_L2PE_COMPUTE_CYCLES`)
   - Unified memory DMA read/write bandwidth (`kANE_DMA_READWRITE_BYTES`)
   - Pipeline input/output stalls (`kANE_NE_OUTPUT_STALL_CYCLES`, `kANE_L2PE_INPUT_STALL_CYCLES`)
@@ -171,17 +171,17 @@ FORCE_USER_SPACE_ANE_BUNDLE=1 ./dump_ane_pmu_objc resnet50_fp16.aimodel
 | **[00]** | `kANE_AF_TO_L2_DATA` | On-Chip L2 SRAM Bus | Activation feeder bytes transferred to L2 |
 | **[01]** | `kANE_AF_TO_KM_DATA` | On-Chip L2 SRAM Bus | Kernel memory feeder transfers |
 | **[02]** | `kANE_L2_TO_AF_DATA` | On-Chip L2 SRAM Bus | L2 scratchpad writeback traffic |
-| **[03]** | `kANE_L2_TO_NE_DATA` | On-Chip L2 SRAM Bus | L2 SRAM bytes delivered to Neural Engine matrix cores |
-| **[04]** | `kANE_NE_TO_L2_DATA` | On-Chip L2 SRAM Bus | Neural Engine matrix output written back to L2 |
-| **[05]** | `kANE_INT8_CYCLES` | Convolution Engine (MACs) | Execution cycles in INT8 precision mode |
-| **[06]** | `kANE_FP16_CYCLES` | Convolution Engine (MACs) | Execution cycles in FP16 precision mode |
+| **[03]** | `kANE_L2_TO_NE_DATA` | On-Chip L2 SRAM Bus | L2 SRAM bytes delivered to Neural Engine convolution engine |
+| **[04]** | `kANE_NE_TO_L2_DATA` | On-Chip L2 SRAM Bus | Neural Engine convolution engine output written back to L2 |
+| **[05]** | `kANE_INT8_CYCLES` | Neural Engine (Legacy) | Execution cycles in INT8 precision mode |
+| **[06]** | `kANE_FP16_CYCLES` | Neural Engine (Legacy) | Execution cycles in FP16 precision mode |
 | **[07]** | `kANE_L2_READ_STALL_CYCLES` | Pipeline Stall Detection | Cycles stalled waiting for L2 SRAM read access |
 | **[08]** | `kANE_L2_WRITE_STALL_CYCLES`| Pipeline Stall Detection | Cycles stalled waiting for L2 SRAM write queue |
 | **[09]** | `kANE_KM_STALL_CYCLES` | Pipeline Stall Detection | Kernel memory buffer congestion stalls |
-| **[10]** | `kANE_NE_NOMINAL_CYCLES` | Convolution Engine (MACs) | Baseline reference clock cycles (steady-state DVFS) |
+| **[10]** | `kANE_NE_NOMINAL_CYCLES` | Neural Engine (Clock) | Baseline reference clock cycles (steady-state DVFS) |
 | **[11]** | `kANE_NE_THROTTLE_CYCLES` | Power & Thermal Mgmt | Cycles throttled due to thermal or power budget limits |
 | **[12]** | `kANE_L2_THROTTLE_CYCLES` | Power & Thermal Mgmt | L2 SRAM bus throttling cycles |
-| **[13]** | `kANE_NE_COMPUTE_CYCLES` | Convolution Engine (MACs) | **Active convolution engine Multiply-Accumulate compute cycles** |
+| **[13]** | `kANE_NE_COMPUTE_CYCLES` | Neural Engine (Convolution Engine) | **Active convolution engine Multiply-Accumulate compute cycles** |
 | **[14]** | `kANE_NE_INPUT_STALL_CYCLES` | Pipeline Stall Detection | Cycles convolution engine stalled waiting for input activations |
 | **[15]** | `kANE_NE_OUTPUT_STALL_CYCLES`| Pipeline Stall Detection | Cycles convolution engine stalled waiting to flush output tensors |
 | **[16]** | `kANE_NE_KERNEL_STALL_CYCLES`| Pipeline Stall Detection | Cycles stalled loading weight matrices |
@@ -193,6 +193,10 @@ FORCE_USER_SPACE_ANE_BUNDLE=1 ./dump_ane_pmu_objc resnet50_fp16.aimodel
 | **[22]** | `kANE_L2PE_INPUT_STALL_CYCLES`| Planar Engine (Vector PE)| Vector engine stalls waiting for operands |
 | **[23]** | `kANE_L2PE_OUTPUT_STALL_CYCLES`| Planar Engine (Vector PE)| Vector engine stalls writing back results |
 | **[24-28]** | `kANE_UNKNOWN` | Reserved / Internal | Firmware-internal reserved diagnostic registers |
+
+> [!NOTE]
+> **Planar Engine (PE / L2PE) Hardware Telemetry Across Generations**:
+> In Apple patents, the overall accelerator is termed the **Neural Engine**, featuring a **convolution engine** (MAC array) and a **Planar Engine (PE)** (activations, pooling, element-wise math). On Apple M1 (`h13g`), the Planar Engine is present and active (evident from PE sub-tasks and opcodes in `.hwx` task descriptors), but was simpler and not hooked up to dedicated PMU counters; thus `kANE_L2PE_*` (`[21]-[23]`) report 0. Starting with later microarchitectures (`h16g` / M4), dedicated L2PE telemetry counters were wired up to profile vector compute cycles and pipeline stalls directly.
 
 ---
 
