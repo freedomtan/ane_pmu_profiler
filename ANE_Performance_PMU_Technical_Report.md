@@ -595,110 +595,101 @@ To characterize how Apple's Neural Engine architecture has evolved across four h
 - **Testbed B (Apple M4)**: Host Local Silicon, Apple M4 (`T8132`, TSMC 3nm N3E), Architecture `Apple h16g`, Board Type 272, Driver `AppleH16ANEInterface`, ANE Firmware 208.17, Darwin 24.x (`amfi_get_out_of_my_way=0x1 anedebug=1`).
 - **Workload**: Identical `resnet50_fp16.aimodel` compiled into native localized ANE bundles via `mlir::mpsx::createWriteANERegionsPass`, executed for 20 steady-state iterations with 1 initial warm-up baseline subtraction.
 
-### 6.1 Performance & Hardware Telemetry Overview
+### 6.1 Dual-Model Physical Silicon Telemetry Overview
 
-| Architectural Dimension | Apple M1 (`Apple h13g`) | Apple M4 (`Apple h16g`) | Generational Delta / Speedup |
-| :--- | :--- | :--- | :--- |
-| **Silicon Manufacturing Process** | TSMC 5nm (N5) | TSMC 3nm (N3E) | Next-generation lithography |
-| **Physical Core Count** | 16 Cores | 16 Cores | Constant core topology |
-| **Theoretical Peak Throughput** | 11.0 TOPS (FP16 / INT8) | 38.0 TOPS (FP16 / INT8) | **$3.45\times$ peak compute ceiling** |
-| **Warm-up Latency** | $7.51\text{ ms}$ | $2.97\text{ ms}$ | **$2.53\times$ faster JIT/driver configuration** |
-| **Steady-State Inference Latency** | **$2.068\text{ ms}$** ($2{,}068\text{ µs}$) | **$1.288\text{ ms}$** ($1{,}288\text{ µs}$) | **$1.61\times$ speedup** ($37.7\%$ latency reduction) |
-| **Inference Throughput** | **$483.6\text{ FPS}$** | **$776.5\text{ FPS}$** | **$+60.6\%$ throughput** |
-| **Effective Clock Frequency** | **$1.43\text{ GHz}$** per core | **$2.22\text{ GHz}$** per core | **$+55.2\%$ clock scaling** ($35.57\text{ GHz}$ aggregate) |
-| **Thermal/Power Throttling Cycles**| $929\text{ cycles/iter}$ | $144\text{ cycles/iter}$ | **$6.45\times$ less thermal throttling** |
-| **Convolution Engine Compute Cycles**| **$6{,}598{,}489\text{ cycles}$** | **$3{,}587{,}649\text{ cycles}$** | **$1.84\times$ fewer compute cycles** |
-| **Sustained Arithmetic Efficiency** | **$624.4\text{ MACs / cycle}$** | **$1{,}148.4\text{ MACs / cycle}$** | **$+83.9\%$ compute density** |
-| **Per-Core Arithmetic Density** | $39.0\text{ MACs / cycle / core}$ | $71.8\text{ MACs / cycle / core}$ | Doubled physical MAC lane width |
-| **Planar Engine (L2PE) Cycles** | $0\text{ cycles}$ (unhooked PMU) | **$963{,}072\text{ cycles}$** | Active vector telemetry hooked on M4 |
-| **Pipeline Input Starvation Stalls** | **$1{,}021{,}325\text{ cycles}$** | **$61{,}771\text{ cycles}$** | **$16.5\times$ reduction** in input stalls |
-| **Pipeline Output Flush Stalls** | $1{,}588{,}918\text{ cycles}$ | $3{,}509{,}481\text{ cycles}$ | Output backpressure bottleneck shift |
-| **Kernel / Weight Fetch Stalls** | $58\text{ cycles}$ | $7\text{ cycles}$ | Near-$100\%$ weight cache residency |
-| **Unified DRAM Read Traffic** | $884{,}576\text{ bytes}$ ($0.88\text{ MB}$) | $270{,}377\text{ bytes}$ ($0.27\text{ MB}$) | **$3.27\times$ DRAM read reduction** (L2 SRAM hit) |
-| **Unified DRAM Read/Write Traffic** | $928{,}512\text{ bytes}$ ($0.93\text{ MB}$) | $2{,}162{,}077\text{ bytes}$ ($2.16\text{ MB}$) | Expanded intermediate tile transfers |
+To investigate whether Apple doubled physical multiplier lane density, whether Planar Engine (PE) cycles were folded into Neural Engine (NE) cycles on M1, and how DVFS frequency scaling impacts real-world latency, both **ResNet-50 FP16** (dense 2D convolutions) and **MobileNetV2 FP16** (depthwise separable convolutions) were profiled across both physical testbeds for 20 steady-state iterations:
 
----
-
-### 6.2 Microarchitectural Analysis: What Changed Between M1 and M4?
-
-#### 1. Convolution Engine Multiplier Lane Density Doubling
-For the identical ResNet-50 graph requiring $4.12\text{ Billion MACs}$ of dense 2D convolutions:
-- M1 requires **$6.60\text{ Million cycles}$** on `kANE_NE_COMPUTE_CYCLES`.
-- M4 requires **$3.59\text{ Million cycles}$** on `kANE_NE_COMPUTE_CYCLES` ($1.84\times$ reduction).
-
-Dividing theoretical operations by measured compute cycles reveals the real-world aggregate multiplier utilization:
-$$\text{Efficiency}_{\text{M1}} = \frac{4.12 \times 10^9\text{ MACs}}{6.598 \times 10^6\text{ cycles}} = \mathbf{624.4\text{ MACs / cycle}}$$
-$$\text{Efficiency}_{\text{M4}} = \frac{4.12 \times 10^9\text{ MACs}}{3.588 \times 10^6\text{ cycles}} = \mathbf{1{,}148.4\text{ MACs / cycle}}$$
-
-Across the 16 Neural Engine cores:
-- M1 sustains **$39.0\text{ MACs / cycle / core}$**.
-- M4 sustains **$71.8\text{ MACs / cycle / core}$**.
-
-This demonstrates that Apple physically doubled the execution lane width of the convolution engine multipliers per core, allowing M4 to compute almost twice as many matrix operations per clock tick.
-
-#### 2. DVFS Scaling & Thermal Overhead Reduction
-The baseline reference clock counter (`kANE_NE_NOMINAL_CYCLES`) measures steady-state clock ticks across all 16 cores during the inference interval:
-- On M1, the clock hovers at an effective **$1.43\text{ GHz}$** per core ($22.87\text{ GHz}$ aggregate).
-- On M4, the clock scales to **$2.22\text{ GHz}$** per core ($35.57\text{ GHz}$ aggregate)—a **$+55.2\%$ clock frequency uplift**.
-- Simultaneously, thermal and power budget throttling (`kANE_NE_THROTTLE_CYCLES`) drops from $929\text{ cycles/iter}$ on M1 to just $144\text{ cycles/iter}$ on M4 ($6.45\times$ reduction). The TSMC 3nm N3E process node provides significantly improved thermal headroom, allowing M4 to maintain elevated clock frequencies without triggering DVFS thermal throttling traps.
-
-#### 3. Planar Engine Telemetry: From Embedded Pipeline to Decoupled L2PE
-One of the most notable architectural differences between M1 (`h13g`) and M4 (`h16g`) lies in the Planar Engine (PE):
-- **M1 Behavior**:
-  In M1 silicon, the Planar Engine was architecturally simpler and directly coupled into the processing datapath. Although Planar Engine sub-tasks are actively generated in M1's compiled `.hwx` binary descriptors (handling ReLU activations and residual additions), Apple had **not routed or hooked up dedicated PMU accumulator lines** for the Planar Engine. Consequently, registers `[21]-[23]` (`kANE_L2PE_*`) report `0` on M1 silicon.
-- **M4 Evolution**:
-  In M4 silicon, Apple decoupled and expanded the Planar Engine into the autonomous **L2PE (L2 Planar Engine)** subsystem and hooked up real-time PMU streaming registers:
-  - `kANE_L2PE_COMPUTE_CYCLES` (`[21]`): Latches **$963{,}072\text{ cycles}$** per inference across ResNet-50's 49 ReLUs and 16 residual additions.
-  - `kANE_L2PE_INPUT_STALL_CYCLES` (`[22]`): Latches **$937{,}952\text{ cycles}$** tracking vector operand starvation.
-  - `kANE_L2PE_OUTPUT_STALL_CYCLES` (`[23]`): Tracks vector accumulator write-back congestion into L2 SRAM.
-
-#### 4. Memory Hierarchy & L2 SRAM Ingestion Efficiency
-Comparing unified DRAM traffic across both generations:
-- **DRAM Read Bandwidth (`kANE_DMA_READ_BYTES`)**:
-  M1 reads **$884{,}576\text{ bytes}$** from system RAM per inference, whereas M4 reads only **$270{,}377\text{ bytes}$** ($3.27\times$ reduction). M4 features an enlarged on-chip L2 SRAM cache, allowing intermediate activation tiles and layer parameters to stay resident on-chip rather than spilling out to unified memory.
-- **DRAM Total Read/Write Traffic (`kANE_DMA_READWRITE_BYTES`)**:
-  M1 transfers $928{,}512\text{ bytes}$ total, while M4 transfers $2{,}162{,}077\text{ bytes}$. The higher write traffic on M4 reflects larger tile allocations and wider output staging buffers optimized to feed downstream consumers with minimum latency.
-
-#### 5. Pipeline Bottleneck Inversion: Input Starvation vs. Output Backpressure
-A profound microarchitectural shift revealed by the PMU counters is the **inversion of the primary pipeline bottleneck**:
-- **Input Stalls (`kANE_NE_INPUT_STALL_CYCLES`)**:
-  On M1, input operand starvation is a dominant stall source, consuming **$1{,}021{,}325\text{ cycles}$** ($15.5\%$ of active compute time). On M4, input stalls collapse to just **$61{,}771\text{ cycles}$**—a **$16.5\times$ reduction** enabled by faster L2 SRAM prefetching and widened activation feeder buses (`kANE_AF_TO_L2_DATA`).
-- **Output Stalls (`kANE_NE_OUTPUT_STALL_CYCLES`)**:
-  Conversely, output backpressure stalls increase from **$1{,}588{,}918\text{ cycles}$** on M1 to **$3{,}509{,}481\text{ cycles}$** on M4. Because M4's convolution engine computes matrix products twice as fast, it produces completed activation blocks faster than the downstream write-back queues and Planar Engine stages can drain them into L2 SRAM, shifting the primary limiter from input starvation to output drainage.
+| Architectural Metric | ResNet-50 (M1 `h13g`) | ResNet-50 (M4 `h16g`) | MobileNetV2 (M1 `h13g`) | MobileNetV2 (M4 `h16g`) |
+| :--- | :---: | :---: | :---: | :---: |
+| **Theoretical Workload (MACs)** | $4.12\text{ Billion}$ | $4.12\text{ Billion}$ | $300\text{ Million}$ | $300\text{ Million}$ |
+| **Warm-up Latency** | $7.51\text{ ms}$ | $2.97\text{ ms}$ | $2.88\text{ ms}$ | $0.90\text{ ms}$ |
+| **Steady-State Inference Latency** | **$2.068\text{ ms}$** ($483.6\text{ FPS}$) | **$1.288\text{ ms}$** ($776.5\text{ FPS}$) | **$0.876\text{ ms}$** ($1{,}141.1\text{ FPS}$) | **$0.561\text{ ms}$** ($1{,}783.0\text{ FPS}$) |
+| **Latency Speedup (M1 / M4)** | \multicolumn{2}{c|}{\textbf{$1.61\times$ ($37.7\%$ faster)}} | \multicolumn{2}{c|}{\textbf{$1.56\times$ ($36.0\%$ faster)}} |
+| **Effective Clock per Core** | **$1.43\text{ GHz}$** | **$2.22\text{ GHz}$** ($+55.2\%$) | **$1.51\text{ GHz}$** | **$2.33\text{ GHz}$** ($+54.3\%$) |
+| **Aggregate Clock (16 Cores)** | $22.87\text{ GHz}$ | $35.57\text{ GHz}$ | $24.16\text{ GHz}$ | $37.35\text{ GHz}$ |
+| **Thermal Throttle Cycles (`[11]`)**| $929\text{ cycles}$ | $144\text{ cycles}$ ($6.45\times$ less) | $616\text{ cycles}$ | $792\text{ cycles}$ |
+| **Convolution Cycles (`[13]`)** | **$6{,}598{,}489\text{ cycles}$** | **$3{,}587{,}649\text{ cycles}$** | **$2{,}526{,}970\text{ cycles}$** | **$2{,}977{,}893\text{ cycles}$** |
+| **Compute Cycle Ratio (M1 / M4)**| \multicolumn{2}{c|}{\textbf{$1.84\times$ (M4 takes FEWER)}} | \multicolumn{2}{c|}{\textbf{$0.85\times$ (M4 takes MORE!)}} |
+| **Sustained MACs / Cycle (Chip)** | **$624.4\text{ MACs/cyc}$** | **$1{,}148.4\text{ MACs/cyc}$** | **$118.7\text{ MACs/cyc}$** | **$100.7\text{ MACs/cyc}$** |
+| **Sustained MACs / Cycle / Core** | $39.0\text{ MACs/cyc/core}$ | $71.8\text{ MACs/cyc/core}$ | $7.4\text{ MACs/cyc/core}$ | $6.3\text{ MACs/cyc/core}$ |
+| **Planar Engine Cycles (`[21]`)** | $0$ (unhooked) | **$963{,}072\text{ cycles}$** | $0$ (unhooked) | **$139{,}568\text{ cycles}$** |
+| **L2PE Input Stalls (`[22]`)** | $0$ (unhooked) | **$937{,}952\text{ cycles}$** | $0$ (unhooked) | **$127{,}776\text{ cycles}$** |
+| **Input Starvation Stalls (`[14]`)**| **$1{,}021{,}325\text{ cycles}$** | **$61{,}771\text{ cycles}$** | **$247{,}526\text{ cycles}$** | **$355{,}633\text{ cycles}$** |
+| **Output Flush Stalls (`[15]`)** | **$1{,}588{,}918\text{ cycles}$** | **$3{,}509{,}481\text{ cycles}$** | **$46{,}779\text{ cycles}$** | **$6{,}340\text{ cycles}$** |
+| **Unified DRAM Read (`[18]`)** | $884{,}576\text{ bytes}$ | $270{,}377\text{ bytes}$ ($3.27\times$ drop) | $127{,}440\text{ bytes}$ | $13{,}714\text{ bytes}$ ($9.3\times$ drop) |
+| **Unified DRAM Read/Write (`[17]`)**| $928{,}512\text{ bytes}$ | $2{,}162{,}077\text{ bytes}$ | $140{,}016\text{ bytes}$ | $985{,}610\text{ bytes}$ |
 
 ---
 
-### 6.3 Complete 29-Register PMU Comparison Matrix
+### 6.2 Deep Microarchitectural Analysis & Hypothesis Testing
+
+#### Hypothesis 1: Did Apple Double the Multiplier Lane Width, or Is Compute Scaling Model-Dependent?
+A central question is whether Apple physically doubled the execution lane width of the convolution engine multipliers per core between H13 and H16.
+- **The ResNet-50 Evidence ($1.84\times$ Cycle Reduction)**:
+  ResNet-50 consists of standard 2D convolutions with channel depths ranging from $C_{\text{in}} = 64$ to $2{,}048$. Here, M4 requires **$1.84\times$ fewer compute cycles** ($3.59\text{M}$ vs $6.60\text{M}$), sustaining **$71.8\text{ MACs / cycle / core}$** on M4 compared to **$39.0\text{ MACs / cycle / core}$** on M1.
+- **The MobileNetV2 Contradiction ($0.85\times$ Cycle Expansion)**:
+  If the convolution engine simply possessed double the general execution capacity, MobileNetV2 would also exhibit a drop in cycles. Instead, M4 takes **$+17.8\%$ MORE convolution cycles** ($2.98\text{M}$ vs $2.53\text{M}$) to execute MobileNetV2!
+- **Microarchitectural Explanation**:
+  Apple's convolution engine features dedicated cross-channel multiplier lanes (`ChannelsPerEngine`). In dense convolutions ($C \ge 64$), doubling the channel multiplier lanes allows twice as many input channels to be multiplied simultaneously. However, in **depthwise convolutions** ($C_{\text{in}} = 1$), each channel is isolated. The extra multiplier lanes cannot be utilized without cross-channel packing, meaning they sit idle as zero/bubble operations. Furthermore, because M4 has wider tile alignment constraints (e.g. 64- or 128-channel granularity), the padding overhead for small channel slices slightly increases the cycle count.
+- **Conclusion**: Apple widened the channel multiplier lanes per core, which dramatically accelerates dense convolutions ($C \ge 64$), but provides zero compute benefit for isolated depthwise convolutions ($C = 1$).
+
+#### Hypothesis 2: Were Planar Engine (PE) Cycles Folded Into NE Cycles on M1?
+Could M1's `kANE_NE_COMPUTE_CYCLES` counter be reporting combined Convolution + Planar Engine cycles because M1's PE was inlined into the pipeline without dedicated PMU routing?
+- **Testing on ResNet-50**:
+  On M4, ResNet-50 records $3{,}587{,}649\text{ convolution cycles}$ and $963{,}072\text{ L2PE cycles}$ (sum = $4{,}550{,}721\text{ cycles}$).
+  If M1 folded PE into NE, M1's pure convolution cycles would be:
+  $$\text{NE}_{\text{M1,conv}} \approx 6{,}598{,}489 - 963{,}072 = 5{,}635{,}417\text{ cycles}$$
+  Comparing pure convolution cycles would yield a speedup of $5.64\text{M} / 3.59\text{M} \approx \mathbf{1.57\times}$ (rather than $1.84\times$).
+- **Testing on MobileNetV2**:
+  On M4, MobileNetV2 records $2{,}977{,}893\text{ convolution cycles}$ and $139{,}568\text{ L2PE cycles}$ (sum = $3{,}117{,}461\text{ cycles}$).
+  On M1, `kANE_NE_COMPUTE_CYCLES` is **$2{,}526{,}970\text{ cycles}$**.
+  Notice that M1's NE counter is already **$450{,}923\text{ cycles LOWER}$** than M4's convolution counter alone! If M1 also contained PE cycles, M1's pure convolution cycles would be even lower ($\approx 2.39\text{M}$).
+- **Conclusion**: PE folding onto M1 cannot explain the cross-generational numbers. On M1, `kANE_NE_COMPUTE_CYCLES` was already counting the convolution engine specifically, and M1's Planar Engine simply operated without hooked PMU accumulator lines.
+
+#### Hypothesis 3: Latency Speedup Decomposition (Clock Uplift vs. Compute Efficiency)
+Decomposing real-world latency reveals where the generational speedups actually originate:
+1. **MobileNetV2 ($1.56\times$ Speedup)**:
+   - Inference latency drops from $0.876\text{ ms}$ to $0.561\text{ ms}$ ($1.56\times$).
+   - The effective clock frequency increases from $1.51\text{ GHz}$ to $2.33\text{ GHz}$ ($1.54\times$).
+   - **Insight**: For depthwise architectures like MobileNetV2, **$100\%$ of the physical speedup is driven by DVFS clock frequency scaling**, as compute cycles remained virtually unchanged ($2.53\text{M} \to 2.98\text{M}$).
+2. **ResNet-50 ($1.61\times$ Speedup)**:
+   - Compute cycles dropped by $1.84\times$ and clock increased by $1.55\times$. Naively, one would expect a $(1.84 \times 1.55) \approx 2.85\times$ speedup.
+   - Why is the observed speedup only $1.61\times$?
+   - **Insight**: Because on M4, **Output Backpressure Stalls (`kANE_NE_OUTPUT_STALL_CYCLES`) exploded from $1.59\text{M}$ to $3.51\text{M}$ cycles**. The convolution engine computes matrix blocks so quickly that the downstream accumulation write-back queues into L2 SRAM become congested, holding back overall end-to-end latency.
+
+---
+
+### 6.3 Complete 29-Register PMU Comparison Matrix (ResNet-50 vs. MobileNetV2)
 
 Below is the calibrated per-inference delta table captured on physical M1 (`h13g`) and M4 (`h16g`) silicon over 20 steady-state iterations:
 
-| Register Index | Hardware Register Name | Apple M1 (`h13g`) Delta/Iter | Apple M4 (`h16g`) Delta/Iter | Subsystem Classification |
-| :---: | :--- | :---: | :---: | :--- |
-| `[00]` | `kANE_AF_TO_L2_DATA` | 0 | 0 | On-Chip L2 SRAM Bus |
-| `[01]` | `kANE_AF_TO_KM_DATA` | 0 | 0 | On-Chip L2 SRAM Bus |
-| `[02]` | `kANE_L2_TO_AF_DATA` | Active Cumulative | Active Cumulative | On-Chip L2 SRAM Bus |
-| `[03]` | `kANE_L2_TO_NE_DATA` | 0 | 0 | On-Chip L2 SRAM Bus |
-| `[04]` | `kANE_NE_TO_L2_DATA` | 0 | 0 | On-Chip L2 SRAM Bus |
-| `[05]` | `kANE_INT8_CYCLES` | 0 | 0 | Neural Engine (Legacy) |
-| `[06]` | `kANE_FP16_CYCLES` | 0 | 0 | Neural Engine (Legacy) |
-| `[07]` | `kANE_L2_READ_STALL_CYCLES` | 0 | 0 | Pipeline Stall Detection |
-| `[08]` | `kANE_L2_WRITE_STALL_CYCLES` | 0 | 0 | Pipeline Stall Detection |
-| `[09]` | `kANE_KM_STALL_CYCLES` | 0 | 0 | Pipeline Stall Detection |
-| `[10]` | `kANE_NE_NOMINAL_CYCLES` | **47,296,257** | **45,812,147** | Neural Engine (Clock / Baseline) |
-| `[11]` | `kANE_NE_THROTTLE_CYCLES` | **929** | **144** | Power & Thermal Management |
-| `[12]` | `kANE_L2_THROTTLE_CYCLES` | 21,764,999 | 22,123,048 | Power & Thermal Management |
-| `[13]` | `kANE_NE_COMPUTE_CYCLES` | **6,598,489** | **3,587,649** | Neural Engine (Convolution Engine) |
-| `[14]` | `kANE_NE_INPUT_STALL_CYCLES` | **1,021,325** | **61,771** | Pipeline Stall Detection |
-| `[15]` | `kANE_NE_OUTPUT_STALL_CYCLES`| **1,588,918** | **3,509,481** | Pipeline Stall Detection |
-| `[16]` | `kANE_NE_KERNEL_STALL_CYCLES`| **58** | **7** | Pipeline Stall Detection |
-| `[17]` | `kANE_DMA_READWRITE_BYTES` | **928,512** | **2,162,077** | Unified Memory DMA Bus |
-| `[18]` | `kANE_DMA_READ_BYTES` | **884,576** | **270,377** | Unified Memory DMA Bus |
-| `[19]` | `kANE_DPE_ENERGY` | 38,393,741,721 | 121,869 | Power & Thermal Management |
-| `[20]` | `kANE_L2_NOMINAL_CYCLES` | 0 | 874 | On-Chip L2 SRAM Bus |
-| `[21]` | `kANE_L2PE_COMPUTE_CYCLES` | **0** (unhooked) | **963,072** | Planar Engine (PE / L2PE) |
-| `[22]` | `kANE_L2PE_INPUT_STALL_CYCLES`| **0** (unhooked) | **937,952** | Planar Engine (PE / L2PE) |
-| `[23]` | `kANE_L2PE_OUTPUT_STALL_CYCLES`| **0** (unhooked) | **35,423,785,983** | Planar Engine (PE / L2PE) |
-| `[24-28]` | `kANE_UNKNOWN` | 0 | 0 | Reserved / Internal |
+| Reg | Hardware Register Name | ResNet-50 (M1) | ResNet-50 (M4) | MobileNetV2 (M1) | MobileNetV2 (M4) | Subsystem Classification |
+| :---: | :--- | :---: | :---: | :---: | :---: | :--- |
+| `[00]` | `kANE_AF_TO_L2_DATA` | 0 | 0 | 0 | 0 | On-Chip L2 SRAM Bus |
+| `[01]` | `kANE_AF_TO_KM_DATA` | 0 | 0 | 0 | 0 | On-Chip L2 SRAM Bus |
+| `[02]` | `kANE_L2_TO_AF_DATA` | Cumulative | Cumulative | Cumulative | Cumulative | On-Chip L2 SRAM Bus |
+| `[03]` | `kANE_L2_TO_NE_DATA` | 0 | 0 | 0 | 0 | On-Chip L2 SRAM Bus |
+| `[04]` | `kANE_NE_TO_L2_DATA` | 0 | 0 | 0 | 0 | On-Chip L2 SRAM Bus |
+| `[05]` | `kANE_INT8_CYCLES` | 0 | 0 | 0 | 0 | Neural Engine (Legacy) |
+| `[06]` | `kANE_FP16_CYCLES` | 0 | 0 | 0 | 0 | Neural Engine (Legacy) |
+| `[07]` | `kANE_L2_READ_STALL_CYCLES` | 0 | 0 | 0 | 0 | Pipeline Stall Detection |
+| `[08]` | `kANE_L2_WRITE_STALL_CYCLES` | 0 | 0 | 0 | 0 | Pipeline Stall Detection |
+| `[09]` | `kANE_KM_STALL_CYCLES` | 0 | 0 | 0 | 0 | Pipeline Stall Detection |
+| `[10]` | `kANE_NE_NOMINAL_CYCLES` | **47,296,257** | **45,812,147** | **21,173,874** | **20,945,708** | Neural Engine (Clock / Baseline) |
+| `[11]` | `kANE_NE_THROTTLE_CYCLES` | **929** | **144** | **616** | **792** | Power & Thermal Management |
+| `[12]` | `kANE_L2_THROTTLE_CYCLES` | 21,764,999 | 22,123,048 | 2,955,382 | 2,273,928 | Power & Thermal Management |
+| `[13]` | `kANE_NE_COMPUTE_CYCLES` | **6,598,489** | **3,587,649** | **2,526,970** | **2,977,893** | Neural Engine (Convolution Engine) |
+| `[14]` | `kANE_NE_INPUT_STALL_CYCLES` | **1,021,325** | **61,771** | **247,526** | **355,633** | Pipeline Stall Detection |
+| `[15]` | `kANE_NE_OUTPUT_STALL_CYCLES`| **1,588,918** | **3,509,481** | **46,779** | **6,340** | Pipeline Stall Detection |
+| `[16]` | `kANE_NE_KERNEL_STALL_CYCLES`| **58** | **7** | **38** | **42** | Pipeline Stall Detection |
+| `[17]` | `kANE_DMA_READWRITE_BYTES` | **928,512** | **2,162,077** | **140,016** | **985,610** | Unified Memory DMA Bus |
+| `[18]` | `kANE_DMA_READ_BYTES` | **884,576** | **270,377** | **127,440** | **13,714** | Unified Memory DMA Bus |
+| `[19]` | `kANE_DPE_ENERGY` | 38,393,741,721 | 121,869 | 19,995,135,171 | 13,122 | Power & Thermal Management |
+| `[20]` | `kANE_L2_NOMINAL_CYCLES` | 0 | 874 | 0 | 0 | On-Chip L2 SRAM Bus |
+| `[21]` | `kANE_L2PE_COMPUTE_CYCLES` | **0** | **963,072** | **0** | **139,568** | Planar Engine (PE / L2PE) |
+| `[22]` | `kANE_L2PE_INPUT_STALL_CYCLES`| **0** | **937,952** | **0** | **127,776** | Planar Engine (PE / L2PE) |
+| `[23]` | `kANE_L2PE_OUTPUT_STALL_CYCLES`| **0** | **35,423,785,983**| **0** | **16,041,377,164**| Planar Engine (PE / L2PE) |
+| `[24-28]` | `kANE_UNKNOWN` | 0 | 0 | 0 | 0 | Reserved / Internal |
 
 ---
 
