@@ -16,7 +16,15 @@ extern "C" {
 /// @param inputPath Path to input .mlirb bytecode
 /// @param outputPath Destination directory path for compiled package
 /// @return 0 on success, non-zero on error.
+#if defined(ENABLE_SWIFT_COMPILER) && ENABLE_SWIFT_COMPILER
 int compile_model_for_host(const char *inputPath, const char *outputPath);
+#else
+static inline int compile_model_for_host(const char *inputPath, const char *outputPath) {
+    (void)inputPath;
+    (void)outputPath;
+    return -1;
+}
+#endif
 
 #ifdef __cplusplus
 }

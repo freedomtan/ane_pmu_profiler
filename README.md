@@ -116,28 +116,43 @@ ane_pmu_profiler/
    - **Mode B: Precompiled Hardware Microcode (`kANEFModelPreCompiled`)**:
      If a local `model.hwx` exists in the model directory or is specified via `ANE_HWX_PATH`, the loader binds the raw microcode directly.
    *(Note: Accessing the system daemon cache at `/Library/Caches/com.apple.aned` is entirely optional and only occurs if readable; user-space execution works out of the box without `sudo` or changing system directory permissions).*
-4. **CoreAI Private Swift Interface Generation**:
-   Because `CoreAICompiler.framework` and `CoreAIDelegates.framework` are Apple-private frameworks without public SDK headers, [swift_interface_gen](https://github.com/freedomtan/swift_interface_gen/) is used to extract and generate their `.swiftinterface` files:
+4. **CoreAI Private Swift Interface Generation (Optional)**:
+   > [!NOTE]
+   > This is **optional** and only required if you need on-the-fly CoreAI JIT compilation (`.aimodel` or `.mlirb` into `.mpsgraphpackage`). Standard formats (CoreML `.mlpackage`, `.mlmodel`, `.mlmodelc`, `.mil`, `.espresso.net`, `.hwx`, `.odixpackage`, and pre-compiled `.anecir` bundles) do **not** require Swift or `swift_interface_gen`.
+
+   Because `CoreAICompiler.framework` and `CoreAIDelegates.framework` are Apple-private frameworks without public SDK headers, [swift_interface_gen](https://github.com/freedomtan/swift_interface_gen/) can be used to extract and generate their `.swiftinterface` files:
    ```bash
    git clone https://github.com/freedomtan/swift_interface_gen.git ~/work/swift_interface_gen
    # Generates LocalFrameworks/CoreAICompiler.framework and LocalFrameworks/CoreAIDelegates.framework
    ```
-   The `Makefile` resolves these private module interfaces via `LOCAL_FRAMEWORKS = $(HOME)/work/swift_interface_gen/LocalFrameworks`.
+   The `Makefile` resolves these private module interfaces via `LOCAL_FRAMEWORKS ?= $(HOME)/work/swift_interface_gen/LocalFrameworks`.
 
 ---
 
 ## 5. Building the Toolkit
 
-Run `make all` from the repository root:
+The `Makefile` automatically detects whether `$(LOCAL_FRAMEWORKS)/CoreAICompiler.framework` is present:
+- If **missing**, it defaults to a **pure Objective-C build** (`ENABLE_SWIFT=0`) with zero external dependencies.
+- If **present**, it builds with **Swift CoreAI compiler support enabled** (`ENABLE_SWIFT=1`).
 
+You can also explicitly set the build mode:
+
+### Pure Objective-C Build (Default for standard users, no swift_interface_gen needed)
 ```bash
-make all
+make clean
+make ENABLE_SWIFT=0
 ```
-
 This compiles and signs:
-1. `model_compiler_objc`: Standalone host JIT compiler.
+1. `dump_ane_pmu_objc`: Full 29-register hardware PMU profiler (supports all formats including precompiled CoreAI bundles).
 2. `coreai_loader`: Fast model loader and tensor dimension inspector.
-3. `dump_ane_pmu_objc`: Full 29-register hardware PMU profiler.
+
+### Swift-Enabled Build (With host JIT compiler)
+```bash
+make clean
+make ENABLE_SWIFT=1
+```
+This additionally compiles:
+3. `model_compiler_objc`: Standalone host JIT compiler for `.mlirb` bytecode.
 
 ---
 
@@ -189,9 +204,10 @@ Pass any supported model directly. Format detection, multi-tensor shape extracti
 ./dump_ane_pmu_objc resnet50_fp16.aimodel
 ```
 
-### 2. Manual CLI Format Flags & Overrides
-You can also explicitly specify pipeline modes or override tensor buffer sizes:
+### 2. Manual CLI Format Flags & Performance Options
+You can explicitly specify pipeline modes, override tensor buffer sizes, or supply theoretical MAC/FLOP counts to compute realized hardware throughput and ALU saturation:
 ```bash
+# Explicit format overrides
 ./dump_ane_pmu_objc --coreml path/to/model.mlpackage
 ./dump_ane_pmu_objc --mil path/to/model.mil
 ./dump_ane_pmu_objc --espresso path/to/model.espresso.net
@@ -199,7 +215,20 @@ You can also explicitly specify pipeline modes or override tensor buffer sizes:
 ./dump_ane_pmu_objc --hwx path/to/model.hwx
 ./dump_ane_pmu_objc --coreai path/to/model.aimodel --iters 10
 ./dump_ane_pmu_objc --in-size 0x24c000 --out-size 0x4000 model.hwx
+
+# Throughput & compute capacity calculation (--macs or --flops)
+./dump_ane_pmu_objc ResNet50_fp16.mlmodelc --macs 4.12G
+./dump_ane_pmu_objc MobileNetV2.mlmodelc --macs 300M
+./dump_ane_pmu_objc MobileViTv2.mlmodelc --flops 3.68G
 ```
+
+When `--macs` or `--flops` is specified (supports suffixes `K`, `M`, `G`, `B`), the profiler calculates and displays:
+- **Realized Compute Speed**: `TOPS = (2 * MACs) / (Latency_sec * 1e12)`
+- **Silicon Throughput per Core**: `Total MACs / kANE_NE_NOMINAL_CYCLES` (theoretical max: 256 for FP16, 512 for INT8)
+- **Total Chip Throughput (16 Cores)**: `16 * Throughput / Core` (theoretical max: 4,096 for FP16, 8,192 for INT8)
+- **Sustained ALU Saturation %**: Realized throughput vs. theoretical peak capacity
+- **Gated Compute Cycle Ratio**: `Total MACs / kANE_NE_COMPUTE_CYCLES`
+
 
 ### 3. CoreAI Host JIT Specialization & Inspection
 ```bash
