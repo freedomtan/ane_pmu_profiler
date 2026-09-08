@@ -412,7 +412,7 @@ Disassembly of `-[_ANEPerformanceStats initWithRequestPerformanceBuffer:statsBuf
 - **`add x2, x8, #0x8`**: The driver places an 8-byte timestamp/status header at offset `0x00`.
 - **`mov w3, #0xe8`**: The framework extracts exactly `0xe8` (232) bytes.
 - Since each register is a 64-bit (`uint64_t`, 8 bytes) accumulator:
-  $$\frac{232\text{ bytes}}{8\text{ bytes / register}} = \mathbf{29\text{ hardware registers}}$$
+  `232 bytes / 8 bytes per register = 29 hardware registers`
 
 ---
 
@@ -500,24 +500,30 @@ In Apple's ASIC control logic, `kANE_NE_COMPUTE_CYCLES` (`[13]`) **only incremen
 
 #### B. The L2 SRAM Capacity Threshold (~4–8 MB)
 Empirical tests comparing large spatial maps ($H=256, W=256$) vs. small spatial maps ($H=64, W=64$) pinpoint the physical capacity threshold of on-chip L2 SRAM (Data Buffer 334):
-1. **Above L2 SRAM Capacity ($16\text{ MB}$ per feature map)**:
+1. **Above L2 SRAM Capacity (16 MB per feature map)**:
    - Intermediate feature maps cannot reside in SRAM and must spill to Unified Memory DRAM.
-   - Output stalls explode to **$503\text{M}$ cycles** (FP16), and the accelerator becomes completely DRAM write-bandwidth bound.
-   - Moving from FP16 to INT8 halves tensor volume ($16\text{ MB} \to 8\text{ MB}$), cutting output stalls in half ($503\text{M} \to 233\text{M}$ cycles) and doubling realized throughput (**$18.76 \to 35.87\text{ TOPS}$**).
-2. **Below L2 SRAM Capacity ($1\text{ MB}$ per feature map)**:
+   - Output stalls explode to **503M cycles** (FP16), and the accelerator becomes completely DRAM write-bandwidth bound.
+   - Moving from FP16 to INT8 halves tensor volume (16 MB → 8 MB), cutting output stalls in half (503M → 233M cycles) and doubling realized throughput (**18.76 → 35.87 TOPS**).
+2. **Below L2 SRAM Capacity (1 MB per feature map)**:
    - Intermediate feature maps fit entirely inside L2 SRAM.
-   - Output stalls collapse by **$>16\times$** (down to $15.5\text{M}$ cycles).
-   - The convolution engine achieves **$>12,400\text{ MACs / cycle}$** across 16 cores ($>75\%$ of theoretical peak ALU saturation).
+   - Output stalls collapse by **>16×** (down to 15.5M cycles).
+   - Writeback backpressure disappears, and unstalled compute cycles become directly visible on the reference timebase.
 
 #### C. Throughput Metric Rigor: The "Effective Throughput" Pitfall
-- **The Pitfall**: Calculating "Effective Throughput" as `Total MACs / COMPUTE_CYCLES` produces unphysical artifacts (e.g., $>1\text{ Million MACs/cycle}$) when a model is memory-bound, because it divides the entire algorithmic workload by only the unstalled cycles while ignoring the 500M cycles spent stalled.
+- **The Pitfall**: Calculating "Effective Throughput" as `Total MACs / COMPUTE_CYCLES` produces unphysical artifacts (e.g., >1 Million MACs/cycle) when a model is memory-bound, because it divides the entire algorithmic workload by only the unstalled cycles while ignoring the 500M cycles spent stalled.
 - **The Ground-Truth Metric**: Throughput must be computed against **`kANE_NE_NOMINAL_CYCLES` (`[10]`)**:
-  $$\text{Throughput (MACs / cycle)} = \frac{\text{Total MACs}}{\mathtt{kANE\_NE\_NOMINAL\_CYCLES}}$$
-  This metric is strictly bounded by physical silicon limits ($4,096\text{ MACs/cycle}$ for FP16 and $8,192\text{ MACs/cycle}$ for INT8 across 16 cores) and captures the exact $1.90\times$ integer scaling under real-world DRAM constraints.
+  ```
+  Throughput / Core Cycle          = Total MACs / kANE_NE_NOMINAL_CYCLES
+                                     (Target: up to 256 for FP16, 512 for INT8)
+
+  Total Chip Throughput (16 cores) = 16 × (Total MACs / kANE_NE_NOMINAL_CYCLES)
+                                     (Target: up to 4,096 for FP16, 8,192 for INT8)
+  ```
+  Because `kANE_NE_NOMINAL_CYCLES` records the aggregate unhalted reference clock cycles summed across all 16 cores, dividing `Total MACs` by `NOMINAL_CYCLES` directly yields the throughput per core per cycle (bounded by 256 for FP16 and 512 for INT8). Multiplying by 16 gives total chip throughput (up to 4,096 for FP16 and 8,192 for INT8), capturing the exact 1.90× integer doubling within physical hardware bounds.
 
 #### D. Native INT8 vs. QDQ Precision Mechanics
-- **QDQ Mode (`dequantize -> conv -> quantize`)**: Executes internal convolution math in FP16 precision. The supplemental integer multiplier array `MULB` is clock-gated OFF, resulting in FP16 DMA traffic ($35.3\text{ MB}$) and FP16 throughput ($18.6\text{ TOPS}$).
-- **Native INT8 Mode**: Uses integer tensor contracts throughout, activating dual multiplier arrays in parallel and halving DMA bandwidth ($18.4\text{ MB}$), hitting **$35.87\text{ TOPS}$** (~94.4% of Apple's 38 TOPS ceiling on M4).
+- **QDQ Mode (`dequantize -> conv -> quantize`)**: Executes internal convolution math in FP16 precision. The supplemental integer multiplier array `MULB` is clock-gated OFF, resulting in FP16 DMA traffic (35.3 MB) and FP16 throughput (18.6 TOPS).
+- **Native INT8 Mode**: Uses integer tensor contracts throughout, activating dual multiplier arrays in parallel and halving DMA bandwidth (18.4 MB), hitting **35.87 TOPS** (~94.4% of Apple's 38 TOPS ceiling on M4).
 
 ---
 
@@ -531,12 +537,12 @@ Physical ANE PMU registers are **free-running cumulative 64-bit hardware counter
 
 To measure exact per-inference metrics:
 1. **Warm-up Phase**: Dispatch 1 dry-run inference. This ramps the dynamic voltage/frequency scaling (DVFS) state to steady-state frequency and populates the baseline register state:
-   $$R_{\text{base}}[i] = \text{Reg}[i]_{\text{warmup}} \quad \forall i \in [0, 28]$$
-2. **Benchmark Phase**: Dispatch $N$ measured iterations. Record the final snapshot:
-   $$R_{\text{final}}[i] = \text{Reg}[i]_{N} \quad \forall i \in [0, 28]$$
+   `R_base[i] = Reg[i]_warmup  (for all i in [0, 28])`
+2. **Benchmark Phase**: Dispatch N measured iterations. Record the final snapshot:
+   `R_final[i] = Reg[i]_N  (for all i in [0, 28])`
 3. **Delta Calculation**:
-   $$\Delta_{\text{total}}[i] = R_{\text{final}}[i] - R_{\text{base}}[i]$$
-   $$\Delta_{\text{iter}}[i] = \frac{\Delta_{\text{total}}[i]}{N}$$
+   `Δ_total[i] = R_final[i] - R_base[i]`
+   `Δ_iter[i]  = Δ_total[i] / N`
 
 ---
 
@@ -571,11 +577,11 @@ Measured Silicon Latency      | 1.399 ms (714.9 FPS)   | 0.601 ms (1,663.5 FPS) 
 ### 5.2 Microarchitectural Analysis & Insights
 
 #### A. The Depthwise Convolution Engine Bottleneck
-A major paradox revealed by the PMU data is that while MobileNetV2 requires **$13.7\times$ fewer theoretical operations** than ResNet-50 ($300\text{M}$ vs $4.12\text{B}$ MACs), its Neural Engine convolution engine execution (`kANE_NE_COMPUTE_CYCLES`) takes **nearly the same number of cycles** ($2.98\text{M}$ vs $3.62\text{M}$).
-- **ResNet-50 Sustained Efficiency**:
-  $$\frac{4.12 \times 10^9\text{ MACs}}{3.62 \times 10^6\text{ cycles}} \approx \mathbf{1{,}138\text{ MACs / cycle}}$$
-- **MobileNetV2 Sustained Efficiency**:
-  $$\frac{0.30 \times 10^9\text{ MACs}}{2.98 \times 10^6\text{ cycles}} \approx \mathbf{100\text{ MACs / cycle}}$$
+A major paradox revealed by the PMU data is that while MobileNetV2 requires **13.7× fewer theoretical operations** than ResNet-50 (300M vs 4.12B MACs), its Neural Engine convolution engine execution (`kANE_NE_COMPUTE_CYCLES`) takes **nearly the same number of cycles** (2.98M vs 3.62M).
+- **ResNet-50 Gated Compute Density**:
+  `(4.12 × 10^9 MACs) / (3.62 × 10^6 compute cycles) ≈ 1,138 MACs / compute cycle`
+- **MobileNetV2 Gated Compute Density**:
+  `(0.30 × 10^9 MACs) / (2.98 × 10^6 compute cycles) ≈ 100 MACs / compute cycle`
 
 #### Reverse-Engineering Evidence: Hardware Register Constraints in `ANECompiler.framework`
 Why does MobileNetV2 achieve only $\approx 8.7\%$ of ResNet-50's compute efficiency? Examination of `ANECompiler.framework/ANECompiler` exposes the low-level hardware register configuration assertions programmed into the ANE sequencer:
@@ -676,7 +682,7 @@ Could M1's `kANE_NE_COMPUTE_CYCLES` counter be reporting combined Convolution + 
 - **Testing on ResNet-50**:
   On M4, ResNet-50 records $3{,}587{,}649\text{ convolution cycles}$ and $963{,}072\text{ L2PE cycles}$ (sum = $4{,}550{,}721\text{ cycles}$).
   If M1 folded PE into NE, M1's pure convolution cycles would be:
-  $$\text{NE}_{\text{M1,conv}} \approx 6{,}598{,}489 - 963{,}072 = 5{,}635{,}417\text{ cycles}$$
+  `NE_M1,conv ≈ 6,598,489 - 963,072 = 5,635,417 cycles`
   Comparing pure convolution cycles would yield a speedup of $5.64\text{M} / 3.59\text{M} \approx \mathbf{1.57\times}$ (rather than $1.84\times$).
 - **Testing on MobileNetV2**:
   On M4, MobileNetV2 records $2{,}977{,}893\text{ convolution cycles}$ and $139{,}568\text{ L2PE cycles}$ (sum = $3{,}117{,}461\text{ cycles}$).

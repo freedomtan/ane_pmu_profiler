@@ -211,18 +211,28 @@ In deep networks like ResNet-50 and MobileNetV2, early layers feature large spat
 
 In previous naive profiling analyses, an "Effective Throughput" metric was defined as:
 
-$$\text{Effective Throughput (Flawed)} = \frac{\text{Total Theoretical MACs}}{\text{kANE\_NE\_COMPUTE\_CYCLES}}$$
+```
+Effective Throughput (Flawed) = Total Theoretical MACs / kANE_NE_COMPUTE_CYCLES
+```
 
 This metric produces catastrophic, unphysical artifacts:
-- When a layer suffers severe memory stalls, `kANE_NE_COMPUTE_CYCLES` is clock-gated down to a tiny fraction of elapsed cycles (e.g. $1\text{M}$ cycles out of $500\text{M}$ elapsed cycles).
-- Dividing total work by only unstalled cycles yields calculated throughputs exceeding **$1,000,000\text{ MACs/cycle}$**, which violates the laws of physics on an accelerator whose physical silicon limit is $8,192\text{ MACs/cycle}$.
+- When a layer suffers severe memory stalls, `kANE_NE_COMPUTE_CYCLES` is clock-gated down to a tiny fraction of elapsed cycles (e.g. 1M cycles out of 500M elapsed cycles).
+- Dividing total work by only unstalled cycles yields calculated throughputs exceeding **1,000,000 MACs/cycle**, which violates the laws of physics on an accelerator whose physical silicon limit is 8,192 MACs/cycle.
 
 **The Physically Rigorous Metrics**:
-1. **Nominal Throughput per Silicon Cycle**:
-   $$\text{Throughput}_{\text{Nominal}} = \frac{\text{Total Theoretical MACs}}{\text{kANE\_NOMINAL\_CYCLES}}$$
-   This is strictly bounded by $4,096\text{ MACs/cycle}$ for FP16 and $8,192\text{ MACs/cycle}$ for INT8 across 16 cores.
+1. **Throughput per Nominal Silicon Cycle**:
+   ```
+   Throughput / Core Cycle          = Total MACs / kANE_NE_NOMINAL_CYCLES
+                                      (Physical limit: up to 256 for FP16, 512 for INT8)
+
+   Total Chip Throughput (16 cores) = 16 × (Total MACs / kANE_NE_NOMINAL_CYCLES)
+                                      (Physical limit: up to 4,096 for FP16, 8,192 for INT8)
+   ```
+   Because `kANE_NE_NOMINAL_CYCLES` records the aggregate unhalted reference clock cycles summed across all 16 cores, dividing `Total MACs` by `NOMINAL_CYCLES` directly yields the throughput per core per cycle. Multiplying by 16 yields total chip throughput across all 16 cores.
 2. **Sustained Real-Time Throughput (TOPS)**:
-   $$\text{TOPS} = \frac{2 \times \text{Total Theoretical MACs}}{\text{Wall-Clock Time (Seconds)} \times 10^{12}}$$
+   ```
+   TOPS = (2 × Total MACs) / (Hardware Latency (Seconds) × 10^12)
+   ```
 
 ---
 

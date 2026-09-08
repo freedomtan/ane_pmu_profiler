@@ -62,6 +62,7 @@ typedef struct {
     size_t inBytes;             // Manual input IOSurface size override (0 = auto)
     size_t outBytes;            // Manual output IOSurface size override (0 = auto)
     int numIters;               // Number of inference iterations
+    double totalMacs;           // Theoretical MAC operations per inference pass (0 = unspecified)
 } Config;
 
 #import "coreai_loader.h"
@@ -74,6 +75,7 @@ static uint64_t gInitialRegs[29] = { 0 };
 static uint64_t gFinalRegs[29] = { 0 };
 static BOOL gHasInitialRegs = NO;
 static int gMeasuredIters = 0;
+static double gTotalMacs = 0.0;
 static NSString *gTempCleanupDir = nil;
 
 // --- Helper: Query System ANE Architecture ---
@@ -920,6 +922,30 @@ void decodeAndDumpPmuRegisters(BOOL isUnlocked) {
             printf("  • Effective Silicon Clock      : %.2f GHz per core (%.2f GHz aggregate across 16 cores)\n",
                    effClkGhz / 16.0, effClkGhz);
         }
+
+        if (gTotalMacs > 0.0) {
+            double macsPerCoreCycle = (neNomPerIter > 0) ? (gTotalMacs / (double)neNomPerIter) : 0.0;
+            double chipMacsPerCycle = macsPerCoreCycle * 16.0;
+            double topsRealized = (gLiveHwTimeNs > 0) ? ((gTotalMacs * 2.0) / ((double)gLiveHwTimeNs * 1000.0)) : 0.0;
+            double satFp16 = (macsPerCoreCycle / 256.0) * 100.0;
+            double satInt8 = (macsPerCoreCycle / 512.0) * 100.0;
+
+            printf("----------------------------------------------------------------------------------------------------------------------------------\n");
+            printf("⚡ COMPUTATIONAL THROUGHPUT & REALIZED SILICON CAPACITY (Workload: %'.2f GMACs / %'.2f GOPs):\n",
+                   gTotalMacs / 1e9, (gTotalMacs * 2.0) / 1e9);
+            printf("  • Realized Compute Speed       : %.2f TOPS  (%.2f TFLOPS)\n", topsRealized, topsRealized);
+            printf("  • Silicon Throughput / Core    : %.1f MACs / cycle / core  (Physical Peak: 256 for FP16, 512 for INT8)\n",
+                   macsPerCoreCycle);
+            printf("  • Total Chip Throughput (16x)  : %.1f MACs / cycle  (Physical Peak: 4,096 for FP16, 8,192 for INT8)\n",
+                   chipMacsPerCycle);
+            printf("  • Sustained ALU Saturation     : %.2f%% (vs. FP16 Peak) | %.2f%% (vs. INT8 Peak)\n",
+                   satFp16, satInt8);
+            if (neCompPerIter > 0) {
+                double burstMacsPerCycle = (gTotalMacs / (double)neCompPerIter);
+                printf("  • Gated Compute Cycle Ratio    : %.1f MACs / compute cycle (Reflects unstalled active execution bursts only)\n",
+                       burstMacsPerCycle);
+            }
+        }
     }
     printf("----------------------------------------------------------------------------------------------------------------------------------\n\n");
 
@@ -988,6 +1014,21 @@ void decodeAndDumpPmuRegisters(BOOL isUnlocked) {
     }
 }
 
+static double parseMacsString(const char *str) {
+    if (!str) return 0.0;
+    char *endptr = NULL;
+    double val = strtod(str, &endptr);
+    if (endptr && *endptr != '\0') {
+        while (*endptr == ' ' || *endptr == '\t') endptr++;
+        char suffix = tolower(*endptr);
+        if (suffix == 'k') val *= 1e3;
+        else if (suffix == 'm') val *= 1e6;
+        else if (suffix == 'g' || suffix == 'b') val *= 1e9;
+        else if (suffix == 't') val *= 1e12;
+    }
+    return val;
+}
+
 void printUsage(const char *progName) {
     printf("========================================================================================================\n");
     printf("ANE SILICON PMU PROFILER & TELEMETRY TOOL\n");
@@ -1013,14 +1054,16 @@ void printUsage(const char *progName) {
     printf("  --in-size <bytes>      Override input IOSurface size (hex e.g. 0x24c000, or decimal)\n");
     printf("  --out-size <bytes>     Override output IOSurface size (hex e.g. 0x4000, or decimal)\n");
     printf("  --iters <count>        Number of benchmark iterations (default: 5)\n");
+    printf("  --macs <count>         Theoretical MAC count per inference (e.g. 4.12G, 300M, 1.84B)\n");
+    printf("  --flops <count>        Theoretical FLOP count per inference (automatically halved to MACs)\n");
     printf("  -h, --help             Display this help guide\n\n");
     printf("Examples:\n");
-    printf("  %s ResNet50_fp16.mlmodelc\n", progName);
+    printf("  %s ResNet50_fp16.mlmodelc --macs 4.12G\n", progName);
     printf("  %s MobilenetV4_Large.mlpackage\n", progName);
     printf("  %s MobileDet.mlmodel\n", progName);
     printf("  %s /path/to/model.mil\n", progName);
-    printf("  %s MobileNetV2.mlmodelc/model.espresso.net\n", progName);
-    printf("  %s --anecir resnet50_fp16.aimodel/output_host_jit/ane_bundle\n", progName);
+    printf("  %s MobileNetV2.mlmodelc/model.espresso.net --macs 300M\n", progName);
+    printf("  %s --anecir resnet50_fp16.aimodel/output_host_jit/ane_bundle --macs 4.12G\n", progName);
     printf("  %s --hwx model.hwx\n", progName);
     printf("  %s --odix path/to/model.odixpackage\n", progName);
     printf("  %s --coreai resnet50_fp16.aimodel\n\n", progName);
@@ -1034,6 +1077,7 @@ int main(int argc, const char * argv[]) {
         cfg.inBytes = 0;
         cfg.outBytes = 0;
         cfg.numIters = 5;
+        cfg.totalMacs = 0.0;
 
         for (int i = 1; i < argc; i++) {
             NSString *arg = [NSString stringWithUTF8String:argv[i]];
@@ -1069,13 +1113,24 @@ int main(int argc, const char * argv[]) {
                 cfg.outBytes = (size_t)strtoull(val, NULL, 0);
             } else if ([arg isEqualToString:@"--iters"] && i + 1 < argc) {
                 cfg.numIters = atoi(argv[++i]);
+            } else if ([arg isEqualToString:@"--macs"] && i + 1 < argc) {
+                cfg.totalMacs = parseMacsString(argv[++i]);
+            } else if ([arg isEqualToString:@"--flops"] && i + 1 < argc) {
+                cfg.totalMacs = parseMacsString(argv[++i]) / 2.0;
             } else if ([arg isEqualToString:@"--help"] || [arg isEqualToString:@"-h"]) {
                 printUsage(argv[0]);
                 return 0;
-            } else if (![arg hasPrefix:@"-"] && !cfg.modelPath) {
-                cfg.modelPath = arg;
+            } else if (![arg hasPrefix:@"-"]) {
+                if (!cfg.modelPath) {
+                    cfg.modelPath = arg;
+                } else if (cfg.totalMacs == 0.0 && (isdigit(arg.UTF8String[0]) || arg.UTF8String[0] == '.')) {
+                    // Fallback: second positional argument can be MAC count (e.g. 4.12G)
+                    cfg.totalMacs = parseMacsString(arg.UTF8String);
+                }
             }
         }
+
+        gTotalMacs = cfg.totalMacs;
 
         // Auto-detect default if not specified
         if (!cfg.modelPath) {
