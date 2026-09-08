@@ -3,15 +3,24 @@
 // Apple Neural Engine (ANE) Silicon PMU Register Dump & Live Hardware Telemetry
 //
 // Supports:
-//   - On-the-fly CoreML MIL compilation via _ANEClient (e.g. .mlmodelc)
-//   - Direct execution of standalone precompiled .hwx binaries
-//   - Direct CoreAI / .aimodel / .mlirb JIT & live _ANEClient execution
+//   1. CoreML Models: .mlmodel, .mlpackage, and .mlmodelc (on-the-fly compilation & ANE loading)
+//   2. MIL (Model Intermediate Language): .mil or directory containing model.mil
+//   3. Espresso IR: model.espresso.net (with .shape / .weights)
+//   4. ANECIR: compiler_options_*.plist + *.bc.mlir / net.plist user-space bundle
+//   5. Standalone Pre-compiled .hwx binaries
+//   6. CoreAI: .aimodel / .mlirb via host JIT & _ANEClient
 //
-// Checks driver gate status, allocates statType=2 PMU IOSurface buffer,
-// dispatches live inference on physical silicon, and decodes all 29 hardware registers.
+// Features:
+//   - Automatic format detection from file extension / directory contents
+//   - Dynamic multi-tensor IOSurface allocation from NetworkStatusList (LiveInputList / LiveOutputList)
+//   - Driver gate status check (boot-arg 'anedebug' / com.apple.ane.hardware-counters entitlement)
+//   - PMU IOSurface buffer allocation (statType = 2, 4096 bytes)
+//   - Warm-up & baseline PMU latching + multi-iteration benchmarking
+//   - Full decode of all 29 hardware PMU registers & delta analysis
 //
 
 #import <Foundation/Foundation.h>
+#import <CoreML/CoreML.h>
 #import <Metal/Metal.h>
 #import <IOSurface/IOSurface.h>
 #import <IOKit/IOKitLib.h>
@@ -24,35 +33,75 @@
 extern SecTaskRef SecTaskCreateFromSelf(CFAllocatorRef allocator);
 extern CFTypeRef SecTaskCopyValueForEntitlement(SecTaskRef task, CFStringRef entitlement, CFErrorRef *error);
 
-extern NSString * const kANEFModelTypeKey;
-extern NSString * const kANEFModelPreCompiledValue;
-extern NSString * const kANEFPerformanceStatsMaskKey;
+#define kANEFModelTypeKey                     @"kANEFModelType"
+#define kANEFModelMILValue                    @"kANEFModelMIL"
+#define kANEFModelEspressoValue               @"kANEFModelEspresso"
+#define kANEFModelANECIRValue                 @"kANEFModelANECIR"
+#define kANEFModelCoreMLValue                 @"kANEFModelCoreML"
+#define kANEFModelPreCompiledValue            @"kANEFModelPreCompiled"
+#define kANEFPerformanceStatsMaskKey          @"kANEFPerformanceStatsMask"
+#define kANEFNetPlistFilenameKey              @"kANEFNetPlistFilenameKey"
+#define kANEFCompilerOptionsFilenameKey       @"kANEFCompilerOptionsFilenameKey"
+#define kANEFRetainModelsWithoutSourceURLKey  @"kANEFRetainModelsWithoutSourceURLKey"
+#define kANEFTargetArchitectureKey            @"kANEFTargetArchitectureKey"
 
 typedef enum {
-    RUN_MODE_HWX = 0,     // Standalone pre-compiled .hwx binary
-    RUN_MODE_COMPILE = 1, // CoreML .mlmodelc via _ANEClient
-    RUN_MODE_COREAI = 2   // CoreAI .aimodel / .mlirb via host JIT & _ANEClient
+    RUN_MODE_AUTO = 0,
+    RUN_MODE_COREML,     // .mlmodel, .mlpackage, .mlmodelc
+    RUN_MODE_MIL,        // .mil or directory with model.mil
+    RUN_MODE_ESPRESSO,   // model.espresso.net
+    RUN_MODE_ANECIR,     // compiler_options_*.plist + *.bc.mlir / net.plist
+    RUN_MODE_HWX,        // Standalone pre-compiled .hwx binary
+    RUN_MODE_COREAI,     // CoreAI .aimodel / .mlirb via host JIT & _ANEClient
+    RUN_MODE_ODIX        // Apple Intelligence ODIE package (.odixpackage)
 } RunMode;
 
 typedef struct {
     RunMode runMode;            // Execution pipeline
-    NSString *modelPath;        // Path to .mlmodelc, .hwx, .aimodel, or .mlirb
-    size_t inBytes;             // Input IOSurface size in bytes
-    size_t outBytes;            // Output IOSurface size in bytes
+    NSString *modelPath;        // Path to input model / directory / file
+    size_t inBytes;             // Manual input IOSurface size override (0 = auto)
+    size_t outBytes;            // Manual output IOSurface size override (0 = auto)
     int numIters;               // Number of inference iterations
+    double totalMacs;           // Theoretical MAC operations per inference pass (0 = unspecified)
 } Config;
 
 #import "coreai_loader.h"
 
-static IOSurfaceRef gInSurface = NULL;
-static IOSurfaceRef gOutSurface = NULL;
-static IOSurfaceRef gPmuSurface = NULL;
+// Global state for PMU latching
+static NSMutableArray *gAllocatedSurfaces = nil;
 static _ANEPerformanceStats *gLivePerfStatsObj = nil;
 static uint64_t gLiveHwTimeNs = 0;
 static uint64_t gInitialRegs[29] = { 0 };
 static uint64_t gFinalRegs[29] = { 0 };
 static BOOL gHasInitialRegs = NO;
 static int gMeasuredIters = 0;
+static double gTotalMacs = 0.0;
+static NSString *gTempCleanupDir = nil;
+
+// --- Helper: Query System ANE Architecture ---
+
+static NSString *querySystemANEArchitecture(void) {
+    CFMutableDictionaryRef matching = IOServiceMatching("H11ANEIn");
+    io_service_t service = IOServiceGetMatchingService(kIOMainPortDefault, matching);
+    if (!service) {
+        matching = IOServiceMatching("AppleH16ANEInterface");
+        service = IOServiceGetMatchingService(kIOMainPortDefault, matching);
+    }
+    NSString *archStr = @"h16g";
+    if (service) {
+        CFMutableDictionaryRef props = NULL;
+        if (IORegistryEntryCreateCFProperties(service, &props, kCFAllocatorDefault, 0) == KERN_SUCCESS && props) {
+            NSDictionary *dict = (__bridge NSDictionary *)props;
+            NSDictionary *devProps = dict[@"DeviceProperties"];
+            if (devProps && devProps[@"ANEDevicePropertyTypeANEArchitectureTypeStr"]) {
+                archStr = [devProps[@"ANEDevicePropertyTypeANEArchitectureTypeStr"] copy];
+            }
+            CFRelease(props);
+        }
+        IOObjectRelease(service);
+    }
+    return archStr;
+}
 
 // --- 1. Check ANE Driver & Gating Status ---
 
@@ -153,30 +202,172 @@ BOOL checkAndPrintDriverStatus(void) {
     return isUnlocked;
 }
 
+// --- Helper: Format human-readable bytes ---
+static NSString *formatByteSize(size_t bytes) {
+    if (bytes >= 1024 * 1024) {
+        return [NSString stringWithFormat:@"%.2f MB (%zu bytes)", (double)bytes / (1024.0 * 1024.0), bytes];
+    } else if (bytes >= 1024) {
+        return [NSString stringWithFormat:@"%.2f KB (%zu bytes)", (double)bytes / 1024.0, bytes];
+    }
+    return [NSString stringWithFormat:@"%zu bytes", bytes];
+}
+
+// --- Helper: Compute allocation size from tensor dict ---
+static size_t computeTensorAllocSize(NSDictionary *d, size_t overrideSize) {
+    if (overrideSize > 0) return overrideSize;
+    size_t allocSize = 0;
+    if (d[@"BatchStride"] && d[@"Batches"]) {
+        size_t bs = [d[@"BatchStride"] unsignedLongLongValue];
+        size_t b = [d[@"Batches"] unsignedLongLongValue];
+        if (b == 0) b = 1;
+        allocSize = bs * b;
+    } else if (d[@"PlaneStride"] && d[@"PlaneCount"]) {
+        size_t ps = [d[@"PlaneStride"] unsignedLongLongValue];
+        size_t p = [d[@"PlaneCount"] unsignedLongLongValue];
+        if (p == 0) p = 1;
+        allocSize = ps * p;
+    } else if (d[@"RowStride"] && d[@"Height"]) {
+        size_t rs = [d[@"RowStride"] unsignedLongLongValue];
+        size_t h = [d[@"Height"] unsignedLongLongValue];
+        if (h == 0) h = 1;
+        allocSize = rs * h;
+    }
+    return (allocSize > 0) ? allocSize : 0x4000;
+}
+
+// --- Helper: Create IOSurface with given size ---
+static IOSurfaceRef createIOSurfaceWithSize(size_t allocSize) {
+    NSDictionary *props = @{
+        (id)kIOSurfaceWidth: @(allocSize),
+        (id)kIOSurfaceHeight: @1,
+        (id)kIOSurfaceBytesPerElement: @1,
+        (id)kIOSurfaceBytesPerRow: @(allocSize),
+        (id)kIOSurfaceAllocSize: @(allocSize)
+    };
+    return IOSurfaceCreate((CFDictionaryRef)props);
+}
+
+// --- Helper: Find .hwx binary in package ---
+static NSString *findHWXInPackage(NSString *packagePath) {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSDirectoryEnumerator *enumerator = [fm enumeratorAtPath:packagePath];
+    NSString *file = nil;
+    NSString *firstHwx = nil;
+    while ((file = [enumerator nextObject])) {
+        if ([file hasSuffix:@".hwx"]) {
+            NSString *fullPath = [packagePath stringByAppendingPathComponent:file];
+            if ([file.lastPathComponent isEqualToString:@"binary_0.hwx"]) {
+                return fullPath;
+            }
+            if (!firstHwx) firstHwx = fullPath;
+        }
+    }
+    return firstHwx;
+}
+
+// --- Auto-Detect Model Format ---
+
+static RunMode detectModelFormat(NSString *path) {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    BOOL isDir = NO;
+    if (![fm fileExistsAtPath:path isDirectory:&isDir]) {
+        return RUN_MODE_AUTO;
+    }
+
+    if (isDir) {
+        if ([path hasSuffix:@".odixpackage"] || [fm fileExistsAtPath:[path stringByAppendingPathComponent:@"program.odix"]]) {
+            return RUN_MODE_ODIX;
+        }
+        if ([path hasSuffix:@".mlpackage"]) {
+            return RUN_MODE_COREML;
+        }
+        if ([path hasSuffix:@".aimodel"] || [fm fileExistsAtPath:[path stringByAppendingPathComponent:@"main.mlirb"]]) {
+            return RUN_MODE_COREAI;
+        }
+        if ([path hasSuffix:@".mlmodelc"]) {
+            if ([fm fileExistsAtPath:[path stringByAppendingPathComponent:@"model.espresso.net"]]) {
+                return RUN_MODE_ESPRESSO;
+            }
+            return RUN_MODE_COREML;
+        }
+        NSArray *items = [fm contentsOfDirectoryAtPath:path error:nil];
+        for (NSString *item in items) {
+            if ([item hasSuffix:@".odix"]) {
+                return RUN_MODE_ODIX;
+            }
+            if ([item hasPrefix:@"compiler_options"] && [item hasSuffix:@".plist"]) {
+                return RUN_MODE_ANECIR;
+            }
+            if ([item isEqualToString:@"net.plist"] || [item hasSuffix:@".bc.mlir"]) {
+                return RUN_MODE_ANECIR;
+            }
+            if ([item isEqualToString:@"model.espresso.net"]) {
+                return RUN_MODE_ESPRESSO;
+            }
+            if ([item isEqualToString:@"model.mil"]) {
+                return RUN_MODE_MIL;
+            }
+            if ([item isEqualToString:@"model.hwx"]) {
+                return RUN_MODE_HWX;
+            }
+        }
+        return RUN_MODE_COREML;
+    } else {
+        // Single file
+        if ([path hasSuffix:@".odix"]) {
+            return RUN_MODE_ODIX;
+        }
+        if ([path hasSuffix:@".mlmodel"]) {
+            return RUN_MODE_COREML;
+        }
+        if ([path hasSuffix:@".hwx"]) {
+            return RUN_MODE_HWX;
+        }
+        if ([path hasSuffix:@".mil"]) {
+            return RUN_MODE_MIL;
+        }
+        if ([path hasSuffix:@".espresso.net"] || [path hasSuffix:@".net"]) {
+            return RUN_MODE_ESPRESSO;
+        }
+        if ([path hasSuffix:@".mlirb"]) {
+            return RUN_MODE_COREAI;
+        }
+        if ([path hasSuffix:@".plist"]) {
+            return RUN_MODE_ANECIR;
+        }
+    }
+    return RUN_MODE_COREML;
+}
+
 // --- 2. Live Inference on Physical Silicon & Hardware PMU Latching ---
 
-BOOL runLiveInferenceAndCapturePmu(const Config *cfg) {
+BOOL runLiveInferenceAndCapturePmu(Config *cfg) {
     void *aneHandle = dlopen("/System/Library/PrivateFrameworks/AppleNeuralEngine.framework/AppleNeuralEngine", RTLD_NOW);
     if (!aneHandle) {
         fprintf(stderr, "❌ Failed to dlopen AppleNeuralEngine: %s\n", dlerror());
         return NO;
     }
 
-    if (![[NSFileManager defaultManager] fileExistsAtPath:cfg->modelPath]) {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    if (![fm fileExistsAtPath:cfg->modelPath]) {
         printf("❌ Model file not found at path: %s\n", cfg->modelPath.UTF8String);
         return NO;
     }
 
+    // Auto-detect format if set to AUTO
+    if (cfg->runMode == RUN_MODE_AUTO) {
+        cfg->runMode = detectModelFormat(cfg->modelPath);
+    }
+
     _ANEClient *client = nil;
     _ANEModel *model = nil;
-    size_t inBytes = cfg->inBytes;
-    size_t outBytes = cfg->outBytes;
+    gAllocatedSurfaces = [NSMutableArray array];
+
+    printf("⚡️ PREPARING MODEL FOR PHYSICAL ANE SILICON EXECUTION...\n");
+    printf("  • Target Path              : %s\n", cfg->modelPath.UTF8String);
 
     if (cfg->runMode == RUN_MODE_COREAI) {
-        printf("⚡️ DISPATCHING LIVE INFERENCE ON PHYSICAL ANE SILICON...\n");
         printf("  • Execution Pipeline       : CoreAI Host JIT -> Direct _ANEClient Execution\n");
-        printf("  • Model File Path          : %s\n", cfg->modelPath.UTF8String);
-
         void *rawResult = NULL;
         if (!load_coreai_for_aneclient(cfg->modelPath.UTF8String, &rawResult) || !rawResult) {
             printf("❌ Failed to load CoreAI model into ANEClient.\n");
@@ -187,114 +378,419 @@ BOOL runLiveInferenceAndCapturePmu(const Config *cfg) {
         client = loaderResult.client;
         model = loaderResult.model;
 
-        if (inBytes == 0 && loaderResult.inBytes > 0) {
-            inBytes = (size_t)loaderResult.inBytes;
+        if (cfg->inBytes == 0 && loaderResult.inBytes > 0) {
+            cfg->inBytes = (size_t)loaderResult.inBytes;
         }
-        if (outBytes == 0 && loaderResult.outBytes > 0) {
-            outBytes = (size_t)loaderResult.outBytes;
+        if (cfg->outBytes == 0 && loaderResult.outBytes > 0) {
+            cfg->outBytes = (size_t)loaderResult.outBytes;
         }
-
-        printf("  • Daemon Client Connection : %p\n", (__bridge void *)client);
-        printf("  • Silicon State            : Loaded & Configured on Physical Hardware (Program Handle: %s)\n",
-               [[model valueForKey:@"programHandle"] description].UTF8String ?: "active");
-        printf("  • Input Buffer Size        : %zu bytes (auto-configured)\n", inBytes);
-        printf("  • Output Buffer Size       : %zu bytes (auto-configured)\n", outBytes);
-    } else {
-        // 1. Connect to ANE Daemon
+    } else if (cfg->runMode == RUN_MODE_HWX) {
+        printf("  • Execution Pipeline       : Pre-Compiled Hardware Binary (.hwx)\n");
         client = [_ANEClient sharedConnection];
-        printf("⚡️ DISPATCHING LIVE INFERENCE ON PHYSICAL ANE SILICON...\n");
-        printf("  • Execution Pipeline       : %s\n", cfg->runMode == RUN_MODE_COMPILE ? "_ANEClient JIT Compilation" : "Pre-Compiled .hwx Execution");
-        printf("  • Model File Path          : %s\n", cfg->modelPath.UTF8String);
-        printf("  • Daemon Client Connection : %p\n", (__bridge void *)client);
-
-        // 2. Wrap model in _ANEModel
-        NSURL *modelURL = [NSURL fileURLWithPath:cfg->modelPath];
-        model = [_ANEModel modelAtURL:modelURL key:@"net"];
-
-        // 3. Optional Step: CoreML Compilation
-        if (cfg->runMode == RUN_MODE_COMPILE) {
-            printf("  • CoreML Compiling via     : aned daemon (kANEFModelMIL)... \n");
-            NSError *compErr = nil;
-            NSDictionary *compOpts = @{
-                kANEFModelTypeKey: @"kANEFModelMIL"
-            };
-            uint64_t tComp0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
-            BOOL compOk = [client compileModel:model options:compOpts qos:25 error:&compErr];
-            uint64_t dtComp = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - tComp0;
-
-            if (!compOk) {
-                printf("❌ Compilation failed: %s\n", compErr.description.UTF8String ?: "Unknown error");
-                return NO;
-            }
-            printf("  • Compilation Latency      : %.2f ms (Cache Identifier: %s)\n",
-                   (double)dtComp / 1000000.0, model.cacheURLIdentifier.UTF8String ?: "unknown");
-        }
-
-        // 4. Load Model into Silicon
-        NSError *loadErr = nil;
-        NSDictionary *loadOpts = @{
-            kANEFModelTypeKey: (cfg->runMode == RUN_MODE_COMPILE) ? @"kANEFModelMIL" : kANEFModelPreCompiledValue,
-            kANEFPerformanceStatsMaskKey: @(15)
-        };
-
-        BOOL loadOk = [client loadModel:model options:loadOpts qos:25 error:&loadErr];
-        if (!loadOk) {
-            printf("❌ Failed to load model into ANE silicon: %s\n", loadErr.description.UTF8String ?: "Unknown error");
+        NSURL *hwxURL = [NSURL fileURLWithPath:cfg->modelPath];
+        model = [_ANEModel modelAtURL:hwxURL key:@"net"];
+        if (!model) {
+            printf("❌ Failed to instantiate _ANEModel for %s\n", cfg->modelPath.UTF8String);
             return NO;
         }
-        printf("  • Silicon State            : Loaded & Configured on Physical Hardware\n");
+
+        NSError *loadErr = nil;
+        NSDictionary *loadOpts = @{
+            kANEFModelTypeKey: kANEFModelPreCompiledValue,
+            kANEFPerformanceStatsMaskKey: @(15)
+        };
+        BOOL loadOk = [client loadModel:model options:loadOpts qos:25 error:&loadErr];
+        if (!loadOk) {
+            printf("❌ Failed to load .hwx into ANE silicon: %s\n", loadErr.localizedDescription.UTF8String ?: "Unknown");
+            return NO;
+        }
+    } else if (cfg->runMode == RUN_MODE_COREML) {
+        client = [_ANEClient sharedConnection];
+        NSString *modelcDir = cfg->modelPath;
+
+        // If .mlmodel or .mlpackage, compile via CoreML to temporary .mlmodelc
+        if ([cfg->modelPath hasSuffix:@".mlmodel"] || [cfg->modelPath hasSuffix:@".mlpackage"]) {
+            printf("  • CoreML Compilation      : On-the-fly compiling via MLModel...\n");
+            uint64_t tComp0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+            NSError *compErr = nil;
+            NSURL *compiledURL = [MLModel compileModelAtURL:[NSURL fileURLWithPath:cfg->modelPath] error:&compErr];
+            uint64_t dtComp = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - tComp0;
+
+            if (!compiledURL) {
+                printf("❌ CoreML compilation failed: %s\n", compErr.localizedDescription.UTF8String ?: "Unknown");
+                return NO;
+            }
+            printf("  • CoreML Compilation Time : %.2f ms -> %s\n",
+                   (double)dtComp / 1000000.0, compiledURL.path.UTF8String);
+            modelcDir = compiledURL.path;
+            gTempCleanupDir = modelcDir;
+        }
+
+        // Check format inside .mlmodelc
+        NSString *modelType = kANEFModelMILValue;
+        if ([fm fileExistsAtPath:[modelcDir stringByAppendingPathComponent:@"model.espresso.net"]]) {
+            modelType = kANEFModelEspressoValue;
+        }
+        printf("  • Model Format Detected    : %s inside %s\n", modelType.UTF8String, modelcDir.lastPathComponent.UTF8String);
+
+        model = [_ANEModel modelAtURL:[NSURL fileURLWithPath:modelcDir] key:@"net"];
+        if (!model) {
+            printf("❌ Failed to create _ANEModel at %s\n", modelcDir.UTF8String);
+            return NO;
+        }
+
+        printf("  • ANE Compiler Service     : Compiling via aned daemon (%s)...\n", modelType.UTF8String);
+        uint64_t tAne0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+        NSError *aneCompErr = nil;
+        NSDictionary *compOpts = @{ kANEFModelTypeKey: modelType };
+        BOOL compOk = [client compileModel:model options:compOpts qos:25 error:&aneCompErr];
+        uint64_t dtAne = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - tAne0;
+        if (!compOk) {
+            printf("❌ ANE compilation failed: %s\n", aneCompErr.localizedDescription.UTF8String ?: "Unknown");
+            return NO;
+        }
+        printf("  • ANE Compilation Latency  : %.2f ms\n", (double)dtAne / 1000000.0);
+
+        NSError *loadErr = nil;
+        NSDictionary *loadOpts = @{
+            kANEFModelTypeKey: modelType,
+            kANEFPerformanceStatsMaskKey: @(15)
+        };
+        BOOL loadOk = [client loadModel:model options:loadOpts qos:25 error:&loadErr];
+        if (!loadOk) {
+            printf("❌ Failed to load compiled model into ANE silicon: %s\n", loadErr.localizedDescription.UTF8String ?: "Unknown");
+            return NO;
+        }
+    } else if (cfg->runMode == RUN_MODE_MIL) {
+        printf("  • Execution Pipeline       : Model Intermediate Language (MIL)\n");
+        client = [_ANEClient sharedConnection];
+        NSString *modelDir = cfg->modelPath;
+        BOOL isDir = NO;
+        [fm fileExistsAtPath:cfg->modelPath isDirectory:&isDir];
+
+        if (!isDir) {
+            // Standalone .mil file
+            if ([cfg->modelPath.lastPathComponent isEqualToString:@"model.mil"]) {
+                modelDir = [cfg->modelPath stringByDeletingLastPathComponent];
+            } else {
+                // Stage into temp directory as model.mil
+                char tempTemplate[] = "/tmp/ane_mil_staging_XXXXXX";
+                char *tempPath = mkdtemp(tempTemplate);
+                if (!tempPath) {
+                    printf("❌ Failed to create temporary staging directory for MIL\n");
+                    return NO;
+                }
+                NSString *stageDir = [NSString stringWithUTF8String:tempPath];
+                NSString *stagedMil = [stageDir stringByAppendingPathComponent:@"model.mil"];
+                NSError *copyErr = nil;
+                [fm copyItemAtPath:cfg->modelPath toPath:stagedMil error:&copyErr];
+                modelDir = stageDir;
+                gTempCleanupDir = stageDir;
+                printf("  • Staged MIL Model         : %s -> %s\n", cfg->modelPath.UTF8String, stagedMil.UTF8String);
+            }
+        }
+
+        model = [_ANEModel modelAtURL:[NSURL fileURLWithPath:modelDir] key:@"net"];
+        if (!model) {
+            printf("❌ Failed to create _ANEModel for MIL directory: %s\n", modelDir.UTF8String);
+            return NO;
+        }
+
+        printf("  • ANE Compiler Service     : Compiling MIL via aned daemon...\n");
+        uint64_t t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+        NSError *compErr = nil;
+        NSDictionary *compOpts = @{ kANEFModelTypeKey: kANEFModelMILValue };
+        BOOL compOk = [client compileModel:model options:compOpts qos:25 error:&compErr];
+        uint64_t dt = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0;
+        if (!compOk) {
+            printf("❌ MIL compilation failed: %s\n", compErr.localizedDescription.UTF8String ?: "Unknown");
+            return NO;
+        }
+        printf("  • MIL Compilation Latency  : %.2f ms\n", (double)dt / 1000000.0);
+
+        NSError *loadErr = nil;
+        NSDictionary *loadOpts = @{
+            kANEFModelTypeKey: kANEFModelMILValue,
+            kANEFPerformanceStatsMaskKey: @(15)
+        };
+        BOOL loadOk = [client loadModel:model options:loadOpts qos:25 error:&loadErr];
+        if (!loadOk) {
+            printf("❌ Failed to load MIL model into ANE silicon: %s\n", loadErr.localizedDescription.UTF8String ?: "Unknown");
+            return NO;
+        }
+    } else if (cfg->runMode == RUN_MODE_ESPRESSO) {
+        printf("  • Execution Pipeline       : Espresso IR (model.espresso.net)\n");
+        client = [_ANEClient sharedConnection];
+        NSString *modelDir = cfg->modelPath;
+        BOOL isDir = NO;
+        [fm fileExistsAtPath:cfg->modelPath isDirectory:&isDir];
+        if (!isDir) {
+            modelDir = [cfg->modelPath stringByDeletingLastPathComponent];
+        }
+
+        model = [_ANEModel modelAtURL:[NSURL fileURLWithPath:modelDir] key:@"net"];
+        if (!model) {
+            printf("❌ Failed to create _ANEModel for Espresso directory: %s\n", modelDir.UTF8String);
+            return NO;
+        }
+
+        printf("  • ANE Compiler Service     : Compiling Espresso IR via aned daemon...\n");
+        uint64_t t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+        NSError *compErr = nil;
+        NSDictionary *compOpts = @{ kANEFModelTypeKey: kANEFModelEspressoValue };
+        BOOL compOk = [client compileModel:model options:compOpts qos:25 error:&compErr];
+        uint64_t dt = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0;
+        if (!compOk) {
+            printf("❌ Espresso compilation failed: %s\n", compErr.localizedDescription.UTF8String ?: "Unknown");
+            return NO;
+        }
+        printf("  • Espresso Comp Latency    : %.2f ms\n", (double)dt / 1000000.0);
+
+        NSError *loadErr = nil;
+        NSDictionary *loadOpts = @{
+            kANEFModelTypeKey: kANEFModelEspressoValue,
+            kANEFPerformanceStatsMaskKey: @(15)
+        };
+        BOOL loadOk = [client loadModel:model options:loadOpts qos:25 error:&loadErr];
+        if (!loadOk) {
+            printf("❌ Failed to load Espresso model into ANE silicon: %s\n", loadErr.localizedDescription.UTF8String ?: "Unknown");
+            return NO;
+        }
+    } else if (cfg->runMode == RUN_MODE_ANECIR) {
+        printf("  • Execution Pipeline       : Direct Unprivileged ANECIR Bundle (kANEFModelANECIR)\n");
+        client = [_ANEClient sharedConnection];
+        NSString *bundleDir = cfg->modelPath;
+        BOOL isDir = NO;
+        [fm fileExistsAtPath:cfg->modelPath isDirectory:&isDir];
+        if (!isDir) {
+            bundleDir = [cfg->modelPath stringByDeletingLastPathComponent];
+        }
+
+        // Discover net file and compiler options
+        NSString *regionKey = nil;
+        NSString *compilerOptionsFile = nil;
+        NSString *netFile = nil;
+
+        NSArray *entries = [fm contentsOfDirectoryAtPath:bundleDir error:nil];
+
+        // 1. Look for .bc.mlir (Modern ANECIR)
+        for (NSString *entry in entries) {
+            if ([entry hasSuffix:@".bc.mlir"]) {
+                netFile = entry;
+                regionKey = [entry substringToIndex:(entry.length - @".bc.mlir".length)];
+                break;
+            }
+        }
+
+        // 2. Look for net.plist / <region>.plist (Classic ANECIR)
+        if (!netFile) {
+            if ([entries containsObject:@"net.plist"]) {
+                netFile = @"net.plist";
+                regionKey = @"net";
+            } else {
+                for (NSString *entry in entries) {
+                    if ([entry hasSuffix:@".plist"] && ![entry hasPrefix:@"compiler_options"]) {
+                        netFile = entry;
+                        regionKey = [entry substringToIndex:(entry.length - @".plist".length)];
+                        break;
+                    }
+                }
+            }
+        }
+
+        if (!regionKey) regionKey = @"net";
+
+        // 3. Look for compiler options plist matching regionKey or generic
+        NSString *cand = [NSString stringWithFormat:@"compiler_options_%@.plist", regionKey];
+        if ([entries containsObject:cand]) {
+            compilerOptionsFile = cand;
+        } else if ([entries containsObject:@"compiler_options.plist"]) {
+            compilerOptionsFile = @"compiler_options.plist";
+        } else {
+            for (NSString *entry in entries) {
+                if ([entry hasPrefix:@"compiler_options"] && [entry hasSuffix:@".plist"]) {
+                    compilerOptionsFile = entry;
+                    break;
+                }
+            }
+        }
+
+        if (!netFile) {
+            printf("❌ Could not locate ANECIR network file (*.bc.mlir or *.plist) in %s\n", bundleDir.UTF8String);
+            return NO;
+        }
+
+        // Prioritize actual physical host silicon architecture for ANECIR
+        NSString *targetArch = querySystemANEArchitecture();
+        if (!targetArch || targetArch.length == 0) {
+            targetArch = @"h16g";
+        }
+
+        // 4. If no compiler options file exists, generate a minimal one on-the-fly!
+        if (!compilerOptionsFile) {
+            compilerOptionsFile = [NSString stringWithFormat:@"compiler_options_%@.plist", regionKey];
+            NSString *genPath = [bundleDir stringByAppendingPathComponent:compilerOptionsFile];
+            NSDictionary *genDict = @{
+                targetArch: @{
+                    @"SpatialSplitMode": @"GenericDAG",
+                    @"TargetArchitecture": targetArch
+                }
+            };
+            [genDict writeToFile:genPath atomically:YES];
+            printf("  • Generated Compiler Opts  : %s (auto-configured for %s)\n", compilerOptionsFile.UTF8String, targetArch.UTF8String);
+        }
+        printf("  • Target Architecture      : %s\n", targetArch.UTF8String);
+
+        NSURL *bundleURL = [NSURL fileURLWithPath:bundleDir];
+        model = [_ANEModel modelAtURL:bundleURL key:regionKey mpsConstants:@"constants"];
+        if (!model) {
+            printf("❌ Failed to create _ANEModel for ANECIR bundle: %s\n", bundleDir.UTF8String);
+            return NO;
+        }
+
+        NSDictionary *loadOpts = @{
+            kANEFModelTypeKey: kANEFModelANECIRValue,
+            kANEFCompilerOptionsFilenameKey: compilerOptionsFile,
+            kANEFNetPlistFilenameKey: netFile,
+            kANEFTargetArchitectureKey: targetArch,
+            kANEFPerformanceStatsMaskKey: @(15),
+            kANEFRetainModelsWithoutSourceURLKey: @1
+        };
+
+        NSError *loadErr = nil;
+        BOOL loadOk = [client loadModel:model options:loadOpts qos:25 error:&loadErr];
+        if (!loadOk) {
+            printf("❌ Failed to load ANECIR model into ANE silicon: %s\n", loadErr.localizedDescription.UTF8String ?: "Unknown");
+            return NO;
+        }
+    } else if (cfg->runMode == RUN_MODE_ODIX) {
+        printf("  • Execution Pipeline       : Apple Intelligence ODIE Package (.odixpackage)\n");
+        NSString *hwxPath = findHWXInPackage(cfg->modelPath);
+        if (!hwxPath) {
+            printf("❌ Could not locate compiled ANE microcode (binary_*.hwx) inside %s\n", cfg->modelPath.UTF8String);
+            return NO;
+        }
+        printf("  • Located ANE Hardware HWX : %s\n", hwxPath.UTF8String);
+
+        client = [_ANEClient sharedConnection];
+        NSURL *hwxURL = [NSURL fileURLWithPath:hwxPath];
+        model = [_ANEModel modelAtURL:hwxURL key:@"net"];
+        if (!model) {
+            printf("❌ Failed to instantiate _ANEModel for %s\n", hwxPath.UTF8String);
+            return NO;
+        }
+
+        NSError *loadErr = nil;
+        NSDictionary *loadOpts = @{
+            kANEFModelTypeKey: kANEFModelPreCompiledValue,
+            kANEFPerformanceStatsMaskKey: @(15)
+        };
+        BOOL loadOk = [client loadModel:model options:loadOpts qos:25 error:&loadErr];
+        if (!loadOk) {
+            printf("❌ Failed to load ODIE ANE binary into silicon: %s\n", loadErr.localizedDescription.UTF8String ?: "Unknown");
+            return NO;
+        }
     }
 
-    if (inBytes == 0) inBytes = 0x4c000;
-    if (outBytes == 0) outBytes = 0x4000;
+    printf("  • Daemon Client Connection : %p\n", (__bridge void *)client);
+    printf("  • Silicon State            : Loaded & Configured on Physical Hardware\n");
 
-    // 5. Create Input IOSurface
-    NSDictionary *inProps = @{
-        (id)kIOSurfaceWidth: @(inBytes),
-        (id)kIOSurfaceHeight: @1,
-        (id)kIOSurfaceBytesPerElement: @1,
-        (id)kIOSurfaceBytesPerRow: @(inBytes),
-        (id)kIOSurfaceAllocSize: @(inBytes)
-    };
-    gInSurface = IOSurfaceCreate((CFDictionaryRef)inProps);
-    _ANEIOSurfaceObject *inSurfaceObj = [_ANEIOSurfaceObject objectWithIOSurface:gInSurface];
+    // --- 3. Dynamic Tensor Shape Extraction & Multi-Surface Allocation ---
 
-    // 6. Create Output IOSurface
-    NSDictionary *outProps = @{
-        (id)kIOSurfaceWidth: @(outBytes),
-        (id)kIOSurfaceHeight: @1,
-        (id)kIOSurfaceBytesPerElement: @1,
-        (id)kIOSurfaceBytesPerRow: @(outBytes),
-        (id)kIOSurfaceAllocSize: @(outBytes)
-    };
-    gOutSurface = IOSurfaceCreate((CFDictionaryRef)outProps);
-    _ANEIOSurfaceObject *outSurfaceObj = [_ANEIOSurfaceObject objectWithIOSurface:gOutSurface];
+    NSMutableArray *inSurfaceObjs = [NSMutableArray array];
+    NSMutableArray *inIndices = [NSMutableArray array];
+    NSMutableArray *outSurfaceObjs = [NSMutableArray array];
+    NSMutableArray *outIndices = [NSMutableArray array];
 
-    // 7. Create PMU Stats IOSurface (statType = 2, 4096 bytes)
-    NSDictionary *pmuProps = @{
-        (id)kIOSurfaceWidth: @1024,
-        (id)kIOSurfaceHeight: @1,
-        (id)kIOSurfaceBytesPerElement: @4,
-        (id)kIOSurfaceBytesPerRow: @4096,
-        (id)kIOSurfaceAllocSize: @4096
-    };
-    gPmuSurface = IOSurfaceCreate((CFDictionaryRef)pmuProps);
-    IOSurfaceLock(gPmuSurface, 0, NULL);
-    memset(IOSurfaceGetBaseAddress(gPmuSurface), 0, 4096);
-    IOSurfaceUnlock(gPmuSurface, 0, NULL);
+    NSDictionary *attrs = model.modelAttributes;
+    NSArray *netStatusList = attrs[@"NetworkStatusList"];
+    NSArray *liveInputs = (netStatusList.count > 0) ? netStatusList[0][@"LiveInputList"] : nil;
+    NSArray *liveOutputs = (netStatusList.count > 0) ? netStatusList[0][@"LiveOutputList"] : nil;
 
-    _ANEIOSurfaceObject *pmuIoObj = [_ANEIOSurfaceObject objectWithIOSurface:gPmuSurface];
+    printf("\n📐 HARDWARE TENSOR SURFACE CONFIGURATION:\n");
+    printf("--------------------------------------------------------------------------------------------------------\n");
+
+    if (liveInputs && liveInputs.count > 0) {
+        for (NSUInteger i = 0; i < liveInputs.count; i++) {
+            NSDictionary *d = liveInputs[i];
+            size_t allocSize = computeTensorAllocSize(d, (liveInputs.count == 1) ? cfg->inBytes : 0);
+            IOSurfaceRef s = createIOSurfaceWithSize(allocSize);
+            [gAllocatedSurfaces addObject:(__bridge id)s];
+            [inSurfaceObjs addObject:[_ANEIOSurfaceObject objectWithIOSurface:s]];
+            [inIndices addObject:@(i)];
+
+            NSString *name = d[@"Name"] ?: d[@"Symbol"] ?: [NSString stringWithFormat:@"input_%lu", i];
+            NSString *type = d[@"Type"] ?: @"Float16";
+            NSNumber *b = d[@"Batches"] ?: @1;
+            NSNumber *c = d[@"Channels"] ?: @1;
+            NSNumber *h = d[@"Height"] ?: @1;
+            NSNumber *w = d[@"Width"] ?: @1;
+            printf("  • Input  #%lu : %-26s | Shape: [%s, %s, %s, %s] | Type: %-7s | %s\n",
+                   i, name.UTF8String, b.stringValue.UTF8String, c.stringValue.UTF8String,
+                   h.stringValue.UTF8String, w.stringValue.UTF8String, type.UTF8String,
+                   formatByteSize(allocSize).UTF8String);
+        }
+    } else {
+        // Fallback for models without NetworkStatusList (e.g. bare .hwx)
+        size_t allocSize = (cfg->inBytes > 0) ? cfg->inBytes : 0x4c000;
+        IOSurfaceRef s = createIOSurfaceWithSize(allocSize);
+        [gAllocatedSurfaces addObject:(__bridge id)s];
+        [inSurfaceObjs addObject:[_ANEIOSurfaceObject objectWithIOSurface:s]];
+        [inIndices addObject:@0];
+        printf("  • Input  #0 : default_input              | Shape: [Auto / Raw]            | Type: Raw     | %s\n",
+               formatByteSize(allocSize).UTF8String);
+    }
+
+    if (liveOutputs && liveOutputs.count > 0) {
+        for (NSUInteger i = 0; i < liveOutputs.count; i++) {
+            NSDictionary *d = liveOutputs[i];
+            size_t allocSize = computeTensorAllocSize(d, (liveOutputs.count == 1) ? cfg->outBytes : 0);
+            IOSurfaceRef s = createIOSurfaceWithSize(allocSize);
+            [gAllocatedSurfaces addObject:(__bridge id)s];
+            [outSurfaceObjs addObject:[_ANEIOSurfaceObject objectWithIOSurface:s]];
+            [outIndices addObject:@(i)];
+
+            NSString *name = d[@"Name"] ?: d[@"Symbol"] ?: [NSString stringWithFormat:@"output_%lu", i];
+            NSString *type = d[@"Type"] ?: @"Float16";
+            NSNumber *b = d[@"Batches"] ?: @1;
+            NSNumber *c = d[@"Channels"] ?: @1;
+            NSNumber *h = d[@"Height"] ?: @1;
+            NSNumber *w = d[@"Width"] ?: @1;
+            printf("  • Output #%lu : %-26s | Shape: [%s, %s, %s, %s] | Type: %-7s | %s\n",
+                   i, name.UTF8String, b.stringValue.UTF8String, c.stringValue.UTF8String,
+                   h.stringValue.UTF8String, w.stringValue.UTF8String, type.UTF8String,
+                   formatByteSize(allocSize).UTF8String);
+        }
+    } else {
+        size_t allocSize = (cfg->outBytes > 0) ? cfg->outBytes : 0x4000;
+        IOSurfaceRef s = createIOSurfaceWithSize(allocSize);
+        [gAllocatedSurfaces addObject:(__bridge id)s];
+        [outSurfaceObjs addObject:[_ANEIOSurfaceObject objectWithIOSurface:s]];
+        [outIndices addObject:@0];
+        printf("  • Output #0 : default_output             | Shape: [Auto / Raw]            | Type: Raw     | %s\n",
+               formatByteSize(allocSize).UTF8String);
+    }
+    printf("--------------------------------------------------------------------------------------------------------\n\n");
+
+    // --- 4. Create PMU Stats IOSurface (statType = 2, 4096 bytes) ---
+    IOSurfaceRef pmuSurface = createIOSurfaceWithSize(4096);
+    [gAllocatedSurfaces addObject:(__bridge id)pmuSurface];
+    IOSurfaceLock(pmuSurface, 0, NULL);
+    memset(IOSurfaceGetBaseAddress(pmuSurface), 0, 4096);
+    IOSurfaceUnlock(pmuSurface, 0, NULL);
+
+    _ANEIOSurfaceObject *pmuIoObj = [_ANEIOSurfaceObject objectWithIOSurface:pmuSurface];
     _ANEPerformanceStatsIOSurface *pmuSurfaceObj = [_ANEPerformanceStatsIOSurface objectWithIOSurface:pmuIoObj statType:2];
 
-    // 8. Assemble _ANERequest with perfStats surface
-    _ANERequest *request = [_ANERequest requestWithInputs:@[inSurfaceObj]
-                                             inputIndices:@[@0]
-                                                  outputs:@[outSurfaceObj]
-                                            outputIndices:@[@0]
+    // --- 5. Assemble _ANERequest ---
+    _ANERequest *request = [_ANERequest requestWithInputs:inSurfaceObjs
+                                             inputIndices:inIndices
+                                                  outputs:outSurfaceObjs
+                                            outputIndices:outIndices
                                                 perfStats:@[pmuSurfaceObj]
                                            procedureIndex:@0];
 
-    // 9. Run live silicon inferences
+    // --- 6. Warm-up & Baseline PMU Latching ---
     NSDictionary *evalOpts = @{
         kANEFPerformanceStatsMaskKey: @(15),
         @"enableProfiling": @YES
@@ -305,6 +801,7 @@ BOOL runLiveInferenceAndCapturePmu(const Config *cfg) {
     uint64_t tW0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
     BOOL warmupOk = [client evaluateWithModel:model options:evalOpts request:request qos:25 error:&warmupErr];
     uint64_t dtWarmup = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - tW0;
+
     if (warmupOk) {
         printf("  • Warm-up Completed in     : %9.2f µs (%.3f ms)\n",
                (double)dtWarmup / 1000.0, (double)dtWarmup / 1000000.0);
@@ -317,9 +814,10 @@ BOOL runLiveInferenceAndCapturePmu(const Config *cfg) {
             }
         }
     } else {
-        printf("⚠️  Warm-up iteration failed: %s\n", warmupErr.description.UTF8String ?: "Unknown");
+        printf("⚠️  Warm-up iteration failed: %s\n", warmupErr.localizedDescription.UTF8String ?: "Unknown");
     }
 
+    // --- 7. Benchmark Iterations with Live PMU Streaming ---
     printf("🏃 Executing %d benchmark iterations on physical ANE silicon with hardware PMU streaming...\n", cfg->numIters);
     uint64_t totalNs = 0;
     gMeasuredIters = cfg->numIters;
@@ -332,7 +830,7 @@ BOOL runLiveInferenceAndCapturePmu(const Config *cfg) {
         totalNs += dt;
 
         if (!ok) {
-            printf("❌ Evaluation failed at iteration %d: %s\n", i + 1, evalErr.description.UTF8String ?: "Unknown");
+            printf("❌ Evaluation failed at iteration %d: %s\n", i + 1, evalErr.localizedDescription.UTF8String ?: "Unknown");
             return NO;
         }
 
@@ -385,18 +883,22 @@ void decodeAndDumpPmuRegisters(BOOL isUnlocked) {
     printf("  • Hardware Clock Source   : Dynamic DVFS Clock (~1.064 GHz Nominal Silicon Target)\n");
     printf("  • Benchmark Iterations    : %d iterations (Baseline warm-up subtracted)\n", gMeasuredIters);
 
-    // If we have deltas, print active hardware metric highlights
+    // Delta Highlights
     if (gHasInitialRegs && gMeasuredIters > 0) {
         uint64_t neCompDelta = (gFinalRegs[13] >= gInitialRegs[13]) ? (gFinalRegs[13] - gInitialRegs[13]) : 0;
+        uint64_t neInStallDelta  = (gFinalRegs[14] >= gInitialRegs[14]) ? (gFinalRegs[14] - gInitialRegs[14]) : 0;
+        uint64_t neOutStallDelta = (gFinalRegs[15] >= gInitialRegs[15]) ? (gFinalRegs[15] - gInitialRegs[15]) : 0;
         uint64_t l2peDelta   = (gFinalRegs[21] >= gInitialRegs[21]) ? (gFinalRegs[21] - gInitialRegs[21]) : 0;
         uint64_t dmaRwDelta  = (gFinalRegs[17] >= gInitialRegs[17]) ? (gFinalRegs[17] - gInitialRegs[17]) : 0;
         uint64_t dmaRDelta   = (gFinalRegs[18] >= gInitialRegs[18]) ? (gFinalRegs[18] - gInitialRegs[18]) : 0;
         uint64_t neNomDelta  = (gFinalRegs[10] >= gInitialRegs[10]) ? (gFinalRegs[10] - gInitialRegs[10]) : 0;
-        uint64_t neCompPerIter = neCompDelta / gMeasuredIters;
-        uint64_t l2pePerIter   = l2peDelta / gMeasuredIters;
-        uint64_t dmaRwPerIter  = dmaRwDelta / gMeasuredIters;
-        uint64_t dmaRPerIter   = dmaRDelta / gMeasuredIters;
-        uint64_t neNomPerIter  = neNomDelta / gMeasuredIters;
+        uint64_t neCompPerIter   = neCompDelta / gMeasuredIters;
+        uint64_t neInStallPerIter = neInStallDelta / gMeasuredIters;
+        uint64_t neOutStallPerIter= neOutStallDelta / gMeasuredIters;
+        uint64_t l2pePerIter     = l2peDelta / gMeasuredIters;
+        uint64_t dmaRwPerIter    = dmaRwDelta / gMeasuredIters;
+        uint64_t dmaRPerIter     = dmaRDelta / gMeasuredIters;
+        uint64_t neNomPerIter    = neNomDelta / gMeasuredIters;
 
         double effClkGhz = (gLiveHwTimeNs > 0) ? ((double)neNomPerIter / (double)gLiveHwTimeNs) : 0.0;
 
@@ -404,6 +906,10 @@ void decodeAndDumpPmuRegisters(BOOL isUnlocked) {
         printf("📈 SILICON PMU DELTA HIGHLIGHTS (Per-Inference Activity):\n");
         printf("  • Neural Engine Compute Cycles : %s cycles/iter  (kANE_NE_COMPUTE_CYCLES)\n",
                [numFmt stringFromNumber:@(neCompPerIter)].UTF8String);
+        printf("  • Output Writeback Stalls      : %s cycles/iter  (kANE_NE_OUTPUT_STALL_CYCLES)\n",
+               [numFmt stringFromNumber:@(neOutStallPerIter)].UTF8String);
+        printf("  • Input Operand Stalls         : %s cycles/iter  (kANE_NE_INPUT_STALL_CYCLES)\n",
+               [numFmt stringFromNumber:@(neInStallPerIter)].UTF8String);
         printf("  • L2PE Compute Cycles          : %s cycles/iter  (kANE_L2PE_COMPUTE_CYCLES)\n",
                [numFmt stringFromNumber:@(l2pePerIter)].UTF8String);
         printf("  • Neural Engine Nominal Cycles : %s cycles/iter  (kANE_NE_NOMINAL_CYCLES)\n",
@@ -415,6 +921,30 @@ void decodeAndDumpPmuRegisters(BOOL isUnlocked) {
         if (effClkGhz > 0.0) {
             printf("  • Effective Silicon Clock      : %.2f GHz per core (%.2f GHz aggregate across 16 cores)\n",
                    effClkGhz / 16.0, effClkGhz);
+        }
+
+        if (gTotalMacs > 0.0) {
+            double macsPerCoreCycle = (neNomPerIter > 0) ? (gTotalMacs / (double)neNomPerIter) : 0.0;
+            double chipMacsPerCycle = macsPerCoreCycle * 16.0;
+            double topsRealized = (gLiveHwTimeNs > 0) ? ((gTotalMacs * 2.0) / ((double)gLiveHwTimeNs * 1000.0)) : 0.0;
+            double satFp16 = (macsPerCoreCycle / 256.0) * 100.0;
+            double satInt8 = (macsPerCoreCycle / 512.0) * 100.0;
+
+            printf("----------------------------------------------------------------------------------------------------------------------------------\n");
+            printf("⚡ COMPUTATIONAL THROUGHPUT & REALIZED SILICON CAPACITY (Workload: %'.2f GMACs / %'.2f GOPs):\n",
+                   gTotalMacs / 1e9, (gTotalMacs * 2.0) / 1e9);
+            printf("  • Realized Compute Speed       : %.2f TOPS  (%.2f TFLOPS)\n", topsRealized, topsRealized);
+            printf("  • Silicon Throughput / Core    : %.1f MACs / cycle / core  (Physical Peak: 256 for FP16, 512 for INT8)\n",
+                   macsPerCoreCycle);
+            printf("  • Total Chip Throughput (16x)  : %.1f MACs / cycle  (Physical Peak: 4,096 for FP16, 8,192 for INT8)\n",
+                   chipMacsPerCycle);
+            printf("  • Sustained ALU Saturation     : %.2f%% (vs. FP16 Peak) | %.2f%% (vs. INT8 Peak)\n",
+                   satFp16, satInt8);
+            if (neCompPerIter > 0) {
+                double burstMacsPerCycle = (gTotalMacs / (double)neCompPerIter);
+                printf("  • Gated Compute Cycle Ratio    : %.1f MACs / compute cycle (Reflects unstalled active execution bursts only)\n",
+                       burstMacsPerCycle);
+            }
         }
     }
     printf("----------------------------------------------------------------------------------------------------------------------------------\n\n");
@@ -443,7 +973,8 @@ void decodeAndDumpPmuRegisters(BOOL isUnlocked) {
         }
 
         const char *subsystem = "Reserved / Internal";
-        if (i <= 4) subsystem = "On-Chip L2 SRAM Bus";
+        if (i <= 2) subsystem = "Activation Feeder / Data Processor";
+        else if (i <= 4) subsystem = "On-Chip L2 SRAM Bus";
         else if (i <= 6) subsystem = "Neural Engine (Convolution Engine)";
         else if (i <= 9) subsystem = "Pipeline Stall Detection";
         else if (i == 10) subsystem = "Neural Engine (Clock / Baseline)";
@@ -470,44 +1001,106 @@ void decodeAndDumpPmuRegisters(BOOL isUnlocked) {
     printf("==================================================================================================================================\n\n");
     fflush(stdout);
 
-    if (gInSurface) CFRelease(gInSurface);
-    if (gOutSurface) CFRelease(gOutSurface);
-    if (gPmuSurface) CFRelease(gPmuSurface);
+    // Clean up allocated surfaces
+    for (id obj in gAllocatedSurfaces) {
+        CFRelease((__bridge CFTypeRef)obj);
+    }
+    [gAllocatedSurfaces removeAllObjects];
+
+    // Clean up temporary compilation directory if created
+    if (gTempCleanupDir) {
+        [[NSFileManager defaultManager] removeItemAtPath:gTempCleanupDir error:nil];
+        gTempCleanupDir = nil;
+    }
+}
+
+static double parseMacsString(const char *str) {
+    if (!str) return 0.0;
+    char *endptr = NULL;
+    double val = strtod(str, &endptr);
+    if (endptr && *endptr != '\0') {
+        while (*endptr == ' ' || *endptr == '\t') endptr++;
+        char suffix = tolower(*endptr);
+        if (suffix == 'k') val *= 1e3;
+        else if (suffix == 'm') val *= 1e6;
+        else if (suffix == 'g' || suffix == 'b') val *= 1e9;
+        else if (suffix == 't') val *= 1e12;
+    }
+    return val;
 }
 
 void printUsage(const char *progName) {
-    printf("Usage: %s [options] [model_path]\n\n", progName);
-    printf("Pipelines / Options:\n");
-    printf("  --coreai <path.aimodel|path.mlirb>  Direct CoreAI JIT -> ANEClient execution\n");
-    printf("  --compile <path.mlmodelc>           Compile CoreML package via _ANEClient and profile\n");
-    printf("  --hwx <path.hwx>                    Directly load standalone pre-compiled .hwx and profile\n");
-    printf("  --in-size <bytes>                   Input IOSurface allocation size (decimal or hex, e.g. 0x24c000)\n");
-    printf("  --out-size <bytes>                  Output IOSurface allocation size (decimal or hex, e.g. 0x4000)\n");
-    printf("  --iters <count>                     Number of inference iterations (default: 5)\n");
-    printf("  --help                              Show this help message\n\n");
+    printf("========================================================================================================\n");
+    printf("ANE SILICON PMU PROFILER & TELEMETRY TOOL\n");
+    printf("========================================================================================================\n");
+    printf("Usage: %s [options] <model_path>\n\n", progName);
+    printf("Supported Model Input Formats (Auto-detected or via flags):\n");
+    printf("  1. CoreML Models       : .mlmodel, .mlpackage, .mlmodelc\n");
+    printf("  2. MIL Models          : .mil, or directory containing model.mil\n");
+    printf("  3. Espresso IR         : model.espresso.net (with .shape / .weights), or .mlmodelc\n");
+    printf("  4. ANECIR Bundles      : compiler_options_*.plist + *.bc.mlir / net.plist\n");
+    printf("  5. Pre-compiled HWX    : standalone .hwx binary\n");
+    printf("  6. CoreAI Graphs       : .aimodel package or .mlirb graph\n");
+    printf("  7. ODIE Packages       : .odixpackage (Apple Intelligence Foundation Models)\n\n");
+    printf("Options:\n");
+    printf("  --coreml <path>        Profile CoreML model (.mlmodel, .mlpackage, or .mlmodelc)\n");
+    printf("  --mil <path>           Profile MIL model (.mil file or directory containing model.mil)\n");
+    printf("  --espresso <path>      Profile Espresso IR (model.espresso.net or directory)\n");
+    printf("  --anecir <path>        Profile unprivileged user-space ANECIR bundle directory\n");
+    printf("  --hwx <path>           Profile pre-compiled hardware binary (.hwx)\n");
+    printf("  --coreai <path>        Profile CoreAI package (.aimodel) or MLIR bytecode (.mlirb)\n");
+    printf("  --odix <path>          Profile Apple Intelligence ODIE package (.odixpackage)\n");
+    printf("  --compile <path>       Compile and load model via _ANEClient and profile\n");
+    printf("  --in-size <bytes>      Override input IOSurface size (hex e.g. 0x24c000, or decimal)\n");
+    printf("  --out-size <bytes>     Override output IOSurface size (hex e.g. 0x4000, or decimal)\n");
+    printf("  --iters <count>        Number of benchmark iterations (default: 5)\n");
+    printf("  --macs <count>         Theoretical MAC count per inference (e.g. 4.12G, 300M, 1.84B)\n");
+    printf("  --flops <count>        Theoretical FLOP count per inference (automatically halved to MACs)\n");
+    printf("  -h, --help             Display this help guide\n\n");
     printf("Examples:\n");
-    printf("  %s --coreai resnet50_fp16.aimodel\n", progName);
-    printf("  %s --coreai resnet50_fp16.aimodel/main.mlirb\n", progName);
+    printf("  %s ResNet50_fp16.mlmodelc --macs 4.12G\n", progName);
+    printf("  %s MobilenetV4_Large.mlpackage\n", progName);
+    printf("  %s MobileDet.mlmodel\n", progName);
+    printf("  %s /path/to/model.mil\n", progName);
+    printf("  %s MobileNetV2.mlmodelc/model.espresso.net --macs 300M\n", progName);
+    printf("  %s --anecir resnet50_fp16.aimodel/output_host_jit/ane_bundle --macs 4.12G\n", progName);
     printf("  %s --hwx model.hwx\n", progName);
-    printf("  %s --compile ResNet50_fp16.mlmodelc\n\n", progName);
+    printf("  %s --odix path/to/model.odixpackage\n", progName);
+    printf("  %s --coreai resnet50_fp16.aimodel\n\n", progName);
 }
 
 int main(int argc, const char * argv[]) {
     @autoreleasepool {
         Config cfg;
-        cfg.runMode = RUN_MODE_HWX;
+        cfg.runMode = RUN_MODE_AUTO;
         cfg.modelPath = nil;
         cfg.inBytes = 0;
         cfg.outBytes = 0;
         cfg.numIters = 5;
+        cfg.totalMacs = 0.0;
 
         for (int i = 1; i < argc; i++) {
             NSString *arg = [NSString stringWithUTF8String:argv[i]];
-            if ([arg isEqualToString:@"--coreai"] && i + 1 < argc) {
+            if ([arg isEqualToString:@"--coreml"] && i + 1 < argc) {
+                cfg.runMode = RUN_MODE_COREML;
+                cfg.modelPath = [NSString stringWithUTF8String:argv[++i]];
+            } else if ([arg isEqualToString:@"--mil"] && i + 1 < argc) {
+                cfg.runMode = RUN_MODE_MIL;
+                cfg.modelPath = [NSString stringWithUTF8String:argv[++i]];
+            } else if ([arg isEqualToString:@"--espresso"] && i + 1 < argc) {
+                cfg.runMode = RUN_MODE_ESPRESSO;
+                cfg.modelPath = [NSString stringWithUTF8String:argv[++i]];
+            } else if ([arg isEqualToString:@"--anecir"] && i + 1 < argc) {
+                cfg.runMode = RUN_MODE_ANECIR;
+                cfg.modelPath = [NSString stringWithUTF8String:argv[++i]];
+            } else if ([arg isEqualToString:@"--odix"] && i + 1 < argc) {
+                cfg.runMode = RUN_MODE_ODIX;
+                cfg.modelPath = [NSString stringWithUTF8String:argv[++i]];
+            } else if ([arg isEqualToString:@"--coreai"] && i + 1 < argc) {
                 cfg.runMode = RUN_MODE_COREAI;
                 cfg.modelPath = [NSString stringWithUTF8String:argv[++i]];
             } else if ([arg isEqualToString:@"--compile"] && i + 1 < argc) {
-                cfg.runMode = RUN_MODE_COMPILE;
+                cfg.runMode = RUN_MODE_COREML;
                 cfg.modelPath = [NSString stringWithUTF8String:argv[++i]];
             } else if ([arg isEqualToString:@"--hwx"] && i + 1 < argc) {
                 cfg.runMode = RUN_MODE_HWX;
@@ -520,23 +1113,26 @@ int main(int argc, const char * argv[]) {
                 cfg.outBytes = (size_t)strtoull(val, NULL, 0);
             } else if ([arg isEqualToString:@"--iters"] && i + 1 < argc) {
                 cfg.numIters = atoi(argv[++i]);
+            } else if ([arg isEqualToString:@"--macs"] && i + 1 < argc) {
+                cfg.totalMacs = parseMacsString(argv[++i]);
+            } else if ([arg isEqualToString:@"--flops"] && i + 1 < argc) {
+                cfg.totalMacs = parseMacsString(argv[++i]) / 2.0;
             } else if ([arg isEqualToString:@"--help"] || [arg isEqualToString:@"-h"]) {
                 printUsage(argv[0]);
                 return 0;
-            } else if (![arg hasPrefix:@"-"] && !cfg.modelPath) {
-                // Direct positional argument: auto-detect pipeline
-                if ([arg hasSuffix:@".hwx"]) {
-                    cfg.runMode = RUN_MODE_HWX;
-                } else if ([arg hasSuffix:@".aimodel"] || [arg hasSuffix:@".mlirb"]) {
-                    cfg.runMode = RUN_MODE_COREAI;
-                } else {
-                    cfg.runMode = RUN_MODE_COMPILE;
+            } else if (![arg hasPrefix:@"-"]) {
+                if (!cfg.modelPath) {
+                    cfg.modelPath = arg;
+                } else if (cfg.totalMacs == 0.0 && (isdigit(arg.UTF8String[0]) || arg.UTF8String[0] == '.')) {
+                    // Fallback: second positional argument can be MAC count (e.g. 4.12G)
+                    cfg.totalMacs = parseMacsString(arg.UTF8String);
                 }
-                cfg.modelPath = arg;
             }
         }
 
-        // Auto-detect defaults if not specified
+        gTotalMacs = cfg.totalMacs;
+
+        // Auto-detect default if not specified
         if (!cfg.modelPath) {
             NSString *defCoreAI = @"resnet50_fp16.aimodel";
             NSString *defHwx = @"model.hwx";
@@ -549,25 +1145,17 @@ int main(int argc, const char * argv[]) {
                 cfg.runMode = RUN_MODE_HWX;
                 cfg.modelPath = defHwx;
             } else if ([[NSFileManager defaultManager] fileExistsAtPath:defMil]) {
-                cfg.runMode = RUN_MODE_COMPILE;
+                cfg.runMode = RUN_MODE_COREML;
                 cfg.modelPath = defMil;
             } else {
-                fprintf(stderr, "❌ No default model found. Please specify --coreai <model.aimodel>, --compile <model.mlmodelc>, or --hwx <model.hwx>\n");
+                fprintf(stderr, "❌ No model path specified.\n\n");
                 printUsage(argv[0]);
                 return 1;
             }
         }
 
-        // Set default buffer sizes based on model mode if not overridden
-        if (cfg.inBytes == 0 && cfg.runMode != RUN_MODE_COREAI) {
-            if (cfg.runMode == RUN_MODE_COMPILE) {
-                cfg.inBytes = 0x24c000; // Batch 8 for ResNet50_fp16
-            } else {
-                cfg.inBytes = 0x4c000;  // Batch 1 for standard precompiled model
-            }
-        }
-        if (cfg.outBytes == 0 && cfg.runMode != RUN_MODE_COREAI) {
-            cfg.outBytes = 0x4000;
+        if (cfg.runMode == RUN_MODE_AUTO) {
+            cfg.runMode = detectModelFormat(cfg.modelPath);
         }
 
         BOOL isUnlocked = checkAndPrintDriverStatus();

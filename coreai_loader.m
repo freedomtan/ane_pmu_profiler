@@ -319,6 +319,7 @@ BOOL load_coreai_for_aneclient(const char *modelPath, void **outResult) {
         uint64_t dtComp = 0;
         // If not found or not compiled, trigger host JIT compilation
         if (!regionHash) {
+#if defined(ENABLE_SWIFT_COMPILER) && ENABLE_SWIFT_COMPILER
             uint64_t tComp0 = mach_absolute_time();
             NSString *outDir = [modelDir stringByAppendingPathComponent:@"output_host_jit"];
             [fm removeItemAtPath:outDir error:nil];
@@ -332,6 +333,13 @@ BOOL load_coreai_for_aneclient(const char *modelPath, void **outResult) {
             mach_timebase_info_data_t tb;
             mach_timebase_info(&tb);
             dtComp = (mach_absolute_time() - tComp0) * tb.numer / tb.denom;
+#else
+            fprintf(stderr, "❌ CoreAI package is not pre-compiled (missing manifest.plist in output_host_jit).\n");
+            fprintf(stderr, "   In-process JIT compilation is disabled in this build (built without Swift support).\n");
+            fprintf(stderr, "   To enable on-the-fly CoreAI compilation, rebuild with ENABLE_SWIFT=1 (requires swift_interface_gen).\n");
+            fprintf(stderr, "   Or pre-compile the model using `model_compiler_objc`.\n");
+            return NO;
+#endif
 
             if ([fm fileExistsAtPath:manifestPath]) {
                 regionHash = extractANERegionHashFromManifest(manifestPath);
