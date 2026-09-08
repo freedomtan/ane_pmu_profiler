@@ -24,47 +24,59 @@ This repository contains a high-performance, self-contained Objective-C and C to
 
 ```mermaid
 flowchart TD
-    subgraph Frontend ["1. Model Asset and Specialization"]
-        MLIRB["main.mlirb<br>(MLIR Bytecode)"]
-        Compiler["model_compiler_objc<br>compile_model_for_host()"]
-        Bridge["model_compiler_bridge.swift<br>CompilationDelegates.mpsGraph"]
-        MLIRB --> Compiler
-        Compiler --> Bridge
+    subgraph Formats ["1. Multi-Format Model Ingestion"]
+        CoreML["CoreML Models<br/>.mlpackage / .mlmodel / .mlmodelc"]
+        MIL["MIL Intermediate Language<br/>.mil"]
+        Espresso["Espresso IR<br/>model.espresso.net + .shape"]
+        ANECIR["ANECIR Bundle (User-Space)<br/>*.bc.mlir + compiler_options.plist"]
+        HWX["Precompiled Microcode<br/>model.hwx"]
+        ODIE["ODIE Package (Apple Intelligence)<br/>model.odixpackage"]
+        CoreAI["CoreAI Graph<br/>.aimodel / .mlirb"]
+        JIT["Optional Host JIT Compiler<br/>(model_compiler_objc / Swift)"]
+        CoreAI -.->|If uncompiled| JIT
+        JIT -.-> ANECIR
     end
 
-    subgraph Package ["2. Specialized Package and Manifest"]
-        PKG["mpsExecutable.mpsgraphpackage<br>manifest.plist and resources.bin"]
-        Bridge --> PKG
-        Manifest["manifest.plist<br>ANERegionsHash per architecture"]
-        PKG --> Manifest
+    subgraph Profiler ["2. Unified Profiler & Buffer Pipeline (dump_ane_pmu_objc)"]
+        Detect["Format Auto-Detection & Loader Dispatch"]
+        Shape["Tensor Shape & Dimension Resolution"]
+        IOSurf["Zero-Copy IOSurface Allocation<br/>(Input & Output DMA Buffers)"]
+        Formats --> Detect
+        Detect --> Shape
+        Shape --> IOSurf
     end
 
-    subgraph Loader ["3. Objective-C Model Loader (coreai_loader.m)"]
-        direction TB
-        subgraph ModeA ["Unprivileged User-Space Bundle (Default)"]
-            Bundle["ane_bundle/<br>region.bc.mlir + compiler_options.plist"]
-            ANEModelA["_ANEModel (+modelAtURL:key:mpsConstants:)<br>kANEFModelANECIR"]
-            Bundle --> ANEModelA
-        end
-        subgraph ModeB ["Precompiled Hardware Binary (.hwx)"]
-            HWX["model.hwx<br>(Compiled ANE Microcode)"]
-            ANEModelB["_ANEModel (+modelAtURL:key:)<br>kANEFModelPreCompiled"]
-            HWX --> ANEModelB
-        end
-        Manifest -.-> ModeA
-        Manifest -.-> ModeB
+    subgraph Runtime ["3. Apple Neural Engine Driver & Silicon Binding"]
+        ANEModel["_ANEModel Configuration<br/>(ANECIR / PreCompiled / MIL / Espresso)"]
+        ANEClient["_ANEClient (User-Space IPC)<br/>-loadModel:options:qos:<br/>-evaluateWithModel:options:request:"]
+        Kernel["AppleH1xANEInterface Kernel Driver<br/>(amfi_get_out_of_my_way=0x1 anedebug=1)"]
+        IOSurf --> ANEModel
+        ANEModel --> ANEClient
+        ANEClient --> Kernel
     end
 
-    subgraph Silicon ["4. Physical Apple Silicon Execution and PMU"]
-        Client["_ANEClient (+sharedConnection)<br>-loadModel:options:qos:error:<br>-evaluateWithModel:options:request:qos:error:"]
-        ANEModelA --> Client
-        ANEModelB --> Client
-        Kernel["AppleH16ANEInterface Kernel Driver<br>(boot-args: anedebug=1)"]
-        Client --> Kernel
-        PMU[("Apple Neural Engine Convolution Engine<br>29 Hardware PMU Registers")]
-        Kernel --> PMU
+    subgraph Hardware ["4. Physical Silicon Hardware & PMU Telemetry"]
+        ANE_HW["Apple Neural Engine Silicon<br/>(16 Cores: Convolution Engines + Planar Engines)"]
+        PMU_HW[("29 Hardware PMU Registers<br/>(Cycles, Stalls, DMA Bytes, Thermal, DPE)")]
+        Kernel --> ANE_HW
+        ANE_HW --> PMU_HW
+    end
+
+    subgraph Telemetry ["5. Telemetry Decoding & Benchmark Suite"]
+        Metrics["Throughput & Efficiency Engine<br/>• Realized TOPS & MACs/Cycle<br/>• ALU Saturation % (FP16/INT8)<br/>• DRAM Bandwidth & Pipeline Stalls"]
+        Scripts["Automated Benchmark Suite<br/>(scripts/benchmark_quantized_models.py)"]
+        PMU_HW --> Metrics
+        Metrics --> Scripts
     end
 ```
+
+The pipeline operates across five modular stages:
+1. **Multi-Format Ingestion**: Supports high-level models (CoreML `.mlpackage`, `.mlmodel`, `.mlmodelc`), mid-level intermediate representations (MIL, Espresso, user-space ANECIR bundles), precompiled silicon microcode (`.hwx`, Apple Intelligence ODIE `.odixpackage`), and CoreAI graphs (with optional Swift host JIT specialization).
+2. **Unified Buffer & Shape Management**: Automatically detects the format, resolves multi-tensor dimensions and strides (from manifests, shape files, or MIL definitions), and allocates zero-copy unified memory `IOSurface` DMA buffers.
+3. **Driver Interface & Silicon Binding**: Binds assets into `_ANEModel` instances with appropriate format keys (`kANEFModelANECIR`, `kANEFModelPreCompiled`, `kANEFModelMIL`, `kANEFModelEspresso`) and dispatches evaluation requests via `_ANEClient` in unprivileged user space.
+4. **Physical Silicon Execution**: Dispatches compute across all 16 ANE cores while the kernel driver (`AppleH1xANEInterface`, enabled via `anedebug=1`) latches all 29 64-bit hardware PMU registers per inference run.
+5. **Telemetry Decoding & Automation**: Decodes raw registers into microarchitectural metrics (realized TOPS, per-core and chip throughput, ALU saturation, memory bandwidth, pipeline stalls) and powers the automated batch benchmark suite (`scripts/benchmark_quantized_models.py`).
+
 
 ---
 
