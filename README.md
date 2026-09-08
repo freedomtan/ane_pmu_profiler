@@ -86,6 +86,12 @@ ane_pmu_profiler/
 ├── model_compiler_bridge.swift              # Swift bridge wrapping CoreAICompiler delegation
 ├── odiec_pipeline.h                         # C-API table declaration for libODIECompiler.dylib
 ├── odiec_pipeline.c                         # Pure C MLIR pass pipeline implementation
+├── reports/                                 # In-depth architectural and quantization reports
+│   └── ANE_Quantization_Performance_Analysis_Report.md # 9-model quantization PMU telemetry analysis
+├── scripts/                                 # Automated profiling and model management suite
+│   ├── README.md                            # Suite documentation and workflow guide
+│   ├── download_quantized_models.py         # Apple CDN model downloader
+│   └── benchmark_quantized_models.py        # Automated multi-model PMU benchmark runner
 └── resnet50_fp16.aimodel/                   # Sample ResNet-50 FP16 CoreAI model bundle
     └── main.mlirb                           # Input MLIR bytecode
 ```
@@ -237,12 +243,35 @@ You can also explicitly specify pipeline modes or override tensor buffer sizes:
 | **[24-28]** | `kANE_UNKNOWN` | Reserved / Internal | Firmware-internal reserved diagnostic registers |
 
 > [!NOTE]
+> **Activation Feeder (AF) & Patent Architecture Mapping**:
+> The register mnemonic `AF` likely stands for something like **Activation Feeder**, which is likely to be the **Data Processor Circuit (318)** in Apple patents (e.g., US11537838B2, US20230135306A1). It acts as the dedicated streaming and crossbar routing engine interfacing the **Data Buffer / L2 Cache (334)** and the **Neural Engines (314A–314N)**.
+
+> [!NOTE]
 > **Planar Engine (PE / L2PE) Hardware Telemetry Across Generations**:
 > In Apple patents, the overall accelerator is termed the **Neural Engine**, featuring a **convolution engine** (MAC array) and a **Planar Engine (PE)** (activations, pooling, element-wise math). On Apple M1 (`h13g`), the Planar Engine is present and active (evident from PE sub-tasks and opcodes in `.hwx` task descriptors), but was simpler and not hooked up to dedicated PMU counters; thus `kANE_L2PE_*` (`[21]-[23]`) report 0. Starting with later microarchitectures (`h16g` / M4), dedicated L2PE telemetry counters were wired up to profile vector compute cycles and pipeline stalls directly.
 
 ---
 
-## 8. Technical References
+## 8. Automated Quantization Profiling Suite (`scripts/`)
 
+To benchmark and profile full model suites across quantization tiers (FP16, Weight-Only INT8, and W8A8), automated automation scripts are provided in [`scripts/`](file:///Users/freedom/work/ios-hacking/ane_pmu_profiler/scripts/):
+
+```bash
+# 1. Download official Apple CoreML models (MobileNetV2, ResNet-50, MobileViTv2)
+python3 scripts/download_quantized_models.py
+
+# 2. Automatically profile all models via dump_ane_pmu_objc and output telemetry matrix
+python3 scripts/benchmark_quantized_models.py
+```
+
+For full details on CLI options, custom directories, and telemetry parsing, see [`scripts/README.md`](file:///Users/freedom/work/ios-hacking/ane_pmu_profiler/scripts/README.md).
+
+---
+
+## 9. Technical References & Deep-Dive Reports
+
+- [`reports/ANE_Quantization_Performance_Analysis_Report.md`](file:///Users/freedom/work/ios-hacking/ane_pmu_profiler/reports/ANE_Quantization_Performance_Analysis_Report.md): In-depth hardware telemetry report comparing 9 CoreML model variants on Apple M4 silicon, detailing dual integer multiplier mechanics (US20240329933A1), L2 SRAM capacity thresholds, memory stall collapse, and energy efficiency.
 - [`ANE_Performance_PMU_Technical_Report.md`](file:///Users/freedom/work/ios-hacking/ane_pmu_profiler/ANE_Performance_PMU_Technical_Report.md): Complete research report detailing the microarchitectural analysis of ResNet-50 vs. MobileNetV2, convolution engine efficiency bottlenecks, and driver security models.
 - [`ODIE_Compiler_C_API_and_Pass_Pipeline.md`](file:///Users/freedom/work/ios-hacking/ane_pmu_profiler/ODIE_Compiler_C_API_and_Pass_Pipeline.md): Comprehensive reference for `libODIECompiler.dylib` C-API, AAPCS64 register `x8` return convention, and MLIR pass execution sequence.
+- [**`measure_ane_capacity`**](https://github.com/freedomtan/measure_ane_capacity): Standalone high-throughput 2D convolution benchmark utilizing this profiler's silicon PMU telemetry techniques to measure peak TOPS, DRAM memory-spill stalls, and serialize self-contained `.mpsgraphpackage` bundles.
+

@@ -436,9 +436,9 @@ Reading the string pointer array at `0x1e126f748` maps out the first 24 hardware
 
 | Index | Hardware Register Name | Architectural Subsystem | Semantic Meaning |
 | :---: | :--- | :--- | :--- |
-| `[00]` | `kANE_AF_TO_L2_DATA` | On-Chip L2 SRAM Bus | Activation Fabric to L2 cache data transfers |
-| `[01]` | `kANE_AF_TO_KM_DATA` | On-Chip L2 SRAM Bus | Activation Fabric to Kernel Memory transfers |
-| `[02]` | `kANE_L2_TO_AF_DATA` | On-Chip L2 SRAM Bus | L2 Cache to Activation Fabric read transfers |
+| `[00]` | `kANE_AF_TO_L2_DATA` | Activation Feeder / Data Processor | Activation Feeder (likely Data Processor 318 in patents) writes to L2 SRAM |
+| `[01]` | `kANE_AF_TO_KM_DATA` | Activation Feeder / Data Processor | Activation Feeder coordination with Kernel Memory DMA (324) |
+| `[02]` | `kANE_L2_TO_AF_DATA` | Activation Feeder / Data Processor | L2 Cache reads into Activation Feeder (Data Processor 318) |
 | `[03]` | `kANE_L2_TO_NE_DATA` | On-Chip L2 SRAM Bus | L2 Cache to Neural Engine convolution engine transfers |
 | `[04]` | `kANE_NE_TO_L2_DATA` | On-Chip L2 SRAM Bus | Neural Engine convolution engine write-backs to L2 cache |
 | `[05]` | `kANE_INT8_CYCLES` | Neural Engine (Legacy) | Static legacy counter on H16 (`816`) |
@@ -462,6 +462,10 @@ Reading the string pointer array at `0x1e126f748` maps out the first 24 hardware
 | `[23]` | `kANE_L2PE_OUTPUT_STALL_CYCLES`| Planar Engine (Vector PE)| Planar Engine result write-back stalls |
 | `[24-28]`| `kANE_UKNOWN` | Reserved / Internal | Unmapped internal hardware telemetry lines |
 
+> [!NOTE]
+> **Activation Feeder (AF) & Data Processor Circuit (318)**:
+> The register mnemonic `AF` likely stands for something like **Activation Feeder**, which is likely to be the **Data Processor Circuit (318)** in Apple patents (e.g., US11537838B2, US20230135306A1). It functions as the streaming engine and hardware crossbar (336 / 500) routing activation slices between the Data Buffer / L2 Cache (334) and the Neural Engines (314A–314N).
+
 ---
 
 ### 3.3 Architectural Evolution: M1 (`h13g`) vs. M4 (`h16g`) and Planar Engine PMU Telemetry
@@ -480,6 +484,40 @@ Empirical verification on physical Apple M1 silicon (`Apple h13g`, board type 64
   In M1 (`h13g`), the Planar Engine was architecturally simpler and tightly integrated into the execution datapath. In this first-generation Apple Silicon Neural Engine design, the dedicated `kANE_L2PE_*` telemetry counters (registers `[21]`, `[22]`, and `[23]`) were **not yet hooked up or routed to the hardware PMU accumulator ring buffer**.
 - **Wired L2PE Telemetry in Later Generations**:
   Starting with subsequent microarchitectures (including Apple `h16g` / M4), Apple decoupled and expanded the Planar Engine into the dedicated L2PE subsystem and wired real-time PMU streaming accumulators directly into the silicon. On M4 silicon, `kANE_L2PE_COMPUTE_CYCLES` registers hundreds of thousands of active vector cycles per inference, enabling clear separation between convolution MAC execution and Planar Engine vector processing.
+
+---
+
+### 3.4 Hardware Counter Gating, L2 SRAM Thresholds, & Throughput Metrics
+
+Recent microarchitectural benchmarking on standalone 2D convolutions (via [`measure_ane_capacity`](https://github.com/freedomtan/measure_ane_capacity)) uncovered critical silicon behaviors regarding counter gating and memory limits:
+
+#### A. Hardware Clock-Gating of `kANE_NE_COMPUTE_CYCLES`
+In Apple's ASIC control logic, `kANE_NE_COMPUTE_CYCLES` (`[13]`) **only increments when the MAC arithmetic arrays are actively stepping and retiring operations without backpressure**:
+- Whenever output writeback queues or DMA channels are saturated, the hardware transitions into an `OUTPUT_STALL` state.
+- **While in `OUTPUT_STALL`, `kANE_NE_COMPUTE_CYCLES` is clock-gated OFF**, and elapsed cycles accumulate exclusively into `kANE_NE_OUTPUT_STALL_CYCLES` (`[15]`).
+- Under memory-bound conditions (e.g. intermediate feature maps larger than on-chip L2 SRAM), the engine spends $>99\%$ of wall-clock time waiting in `OUTPUT_STALL`. As a result, `COMPUTE_CYCLES` registers only brief unstalled bursts (e.g., ~150K cycles out of 500M total cycles).
+- **Total Silicon Execution Cycles**: Summing `COMPUTE_CYCLES + OUTPUT_STALL_CYCLES` (or reading unhalted `kANE_NE_NOMINAL_CYCLES`, `[10]`) accounts for 100% of elapsed execution cycles.
+
+#### B. The L2 SRAM Capacity Threshold (~4–8 MB)
+Empirical tests comparing large spatial maps ($H=256, W=256$) vs. small spatial maps ($H=64, W=64$) pinpoint the physical capacity threshold of on-chip L2 SRAM (Data Buffer 334):
+1. **Above L2 SRAM Capacity ($16\text{ MB}$ per feature map)**:
+   - Intermediate feature maps cannot reside in SRAM and must spill to Unified Memory DRAM.
+   - Output stalls explode to **$503\text{M}$ cycles** (FP16), and the accelerator becomes completely DRAM write-bandwidth bound.
+   - Moving from FP16 to INT8 halves tensor volume ($16\text{ MB} \to 8\text{ MB}$), cutting output stalls in half ($503\text{M} \to 233\text{M}$ cycles) and doubling realized throughput (**$18.76 \to 35.87\text{ TOPS}$**).
+2. **Below L2 SRAM Capacity ($1\text{ MB}$ per feature map)**:
+   - Intermediate feature maps fit entirely inside L2 SRAM.
+   - Output stalls collapse by **$>16\times$** (down to $15.5\text{M}$ cycles).
+   - The convolution engine achieves **$>12,400\text{ MACs / cycle}$** across 16 cores ($>75\%$ of theoretical peak ALU saturation).
+
+#### C. Throughput Metric Rigor: The "Effective Throughput" Pitfall
+- **The Pitfall**: Calculating "Effective Throughput" as `Total MACs / COMPUTE_CYCLES` produces unphysical artifacts (e.g., $>1\text{ Million MACs/cycle}$) when a model is memory-bound, because it divides the entire algorithmic workload by only the unstalled cycles while ignoring the 500M cycles spent stalled.
+- **The Ground-Truth Metric**: Throughput must be computed against **`kANE_NE_NOMINAL_CYCLES` (`[10]`)**:
+  $$\text{Throughput (MACs / cycle)} = \frac{\text{Total MACs}}{\mathtt{kANE\_NE\_NOMINAL\_CYCLES}}$$
+  This metric is strictly bounded by physical silicon limits ($4,096\text{ MACs/cycle}$ for FP16 and $8,192\text{ MACs/cycle}$ for INT8 across 16 cores) and captures the exact $1.90\times$ integer scaling under real-world DRAM constraints.
+
+#### D. Native INT8 vs. QDQ Precision Mechanics
+- **QDQ Mode (`dequantize -> conv -> quantize`)**: Executes internal convolution math in FP16 precision. The supplemental integer multiplier array `MULB` is clock-gated OFF, resulting in FP16 DMA traffic ($35.3\text{ MB}$) and FP16 throughput ($18.6\text{ TOPS}$).
+- **Native INT8 Mode**: Uses integer tensor contracts throughout, activating dual multiplier arrays in parallel and halving DMA bandwidth ($18.4\text{ MB}$), hitting **$35.87\text{ TOPS}$** (~94.4% of Apple's 38 TOPS ceiling on M4).
 
 ---
 
@@ -744,5 +782,7 @@ Based on direct silicon PMU telemetry and disassembled driver behaviors:
 
 1. **Avoid Over-Relying on FLOP Counts**: FLOP and MAC counts from PyTorch or ONNX do not predict ANE runtime. As proven by the PMU counters, MobileNetV2 has $13.7\times$ fewer FLOPs but spends nearly the same cycles on the convolution engine ($2.98\text{M}$ vs $3.62\text{M}$) due to depthwise multiplier underutilization (`hw.ne_control_config.ane_ne_config.r.MACCfg.f.OpMode`).
 2. **Minimize Planar Engine (Vector) Operations**: Large activation layers and element-wise additions incur significant L2PE cycles (`kANE_L2PE_COMPUTE_CYCLES`). Structuring networks with linear bottlenecks and fused activations preserves throughput.
-3. **Control Tensor Dimensions for L2 SRAM Fit**: Keep intermediate feature map tiles within on-chip L2 SRAM to eliminate output pipeline stalls (`kANE_NE_OUTPUT_STALL_CYCLES`), which accounted for over $2.26\text{M}$ stall cycles in ResNet-50.
+3. **Control Tensor Dimensions for L2 SRAM Fit**: Keep intermediate feature map tiles within on-chip L2 SRAM (~4–8 MB) to eliminate output pipeline stalls (`kANE_NE_OUTPUT_STALL_CYCLES`), which explode whenever tensors spill to Unified Memory DRAM.
 4. **Leverage Weight Pinning**: The ANE architecture caches static weights across inferences. Optimizations should prioritize activation streaming bandwidth (`kANE_DMA_READ_BYTES`) rather than re-optimizing weight storage.
+5. **Enforce Native INT8 Rather Than Simulated QDQ**: To reach the 38 TOPS silicon ceiling on M4, models must use native INT8 tensor contracts (`MPSDataTypeInt8` or native INT8 MLIR contracts). Simulated QDQ wrappers dequantize to FP16 internally, falling back to single multiplier arrays, FP16 DMA volume, and 18.6 TOPS.
+6. **Evaluate Compute Density via `NOMINAL_CYCLES`**: When benchmarking hardware throughput, use `kANE_NE_NOMINAL_CYCLES` as the cycle denominator rather than `kANE_NE_COMPUTE_CYCLES` to avoid stall-gated distortion on memory-bound layers.

@@ -884,15 +884,19 @@ void decodeAndDumpPmuRegisters(BOOL isUnlocked) {
     // Delta Highlights
     if (gHasInitialRegs && gMeasuredIters > 0) {
         uint64_t neCompDelta = (gFinalRegs[13] >= gInitialRegs[13]) ? (gFinalRegs[13] - gInitialRegs[13]) : 0;
+        uint64_t neInStallDelta  = (gFinalRegs[14] >= gInitialRegs[14]) ? (gFinalRegs[14] - gInitialRegs[14]) : 0;
+        uint64_t neOutStallDelta = (gFinalRegs[15] >= gInitialRegs[15]) ? (gFinalRegs[15] - gInitialRegs[15]) : 0;
         uint64_t l2peDelta   = (gFinalRegs[21] >= gInitialRegs[21]) ? (gFinalRegs[21] - gInitialRegs[21]) : 0;
         uint64_t dmaRwDelta  = (gFinalRegs[17] >= gInitialRegs[17]) ? (gFinalRegs[17] - gInitialRegs[17]) : 0;
         uint64_t dmaRDelta   = (gFinalRegs[18] >= gInitialRegs[18]) ? (gFinalRegs[18] - gInitialRegs[18]) : 0;
         uint64_t neNomDelta  = (gFinalRegs[10] >= gInitialRegs[10]) ? (gFinalRegs[10] - gInitialRegs[10]) : 0;
-        uint64_t neCompPerIter = neCompDelta / gMeasuredIters;
-        uint64_t l2pePerIter   = l2peDelta / gMeasuredIters;
-        uint64_t dmaRwPerIter  = dmaRwDelta / gMeasuredIters;
-        uint64_t dmaRPerIter   = dmaRDelta / gMeasuredIters;
-        uint64_t neNomPerIter  = neNomDelta / gMeasuredIters;
+        uint64_t neCompPerIter   = neCompDelta / gMeasuredIters;
+        uint64_t neInStallPerIter = neInStallDelta / gMeasuredIters;
+        uint64_t neOutStallPerIter= neOutStallDelta / gMeasuredIters;
+        uint64_t l2pePerIter     = l2peDelta / gMeasuredIters;
+        uint64_t dmaRwPerIter    = dmaRwDelta / gMeasuredIters;
+        uint64_t dmaRPerIter     = dmaRDelta / gMeasuredIters;
+        uint64_t neNomPerIter    = neNomDelta / gMeasuredIters;
 
         double effClkGhz = (gLiveHwTimeNs > 0) ? ((double)neNomPerIter / (double)gLiveHwTimeNs) : 0.0;
 
@@ -900,6 +904,10 @@ void decodeAndDumpPmuRegisters(BOOL isUnlocked) {
         printf("📈 SILICON PMU DELTA HIGHLIGHTS (Per-Inference Activity):\n");
         printf("  • Neural Engine Compute Cycles : %s cycles/iter  (kANE_NE_COMPUTE_CYCLES)\n",
                [numFmt stringFromNumber:@(neCompPerIter)].UTF8String);
+        printf("  • Output Writeback Stalls      : %s cycles/iter  (kANE_NE_OUTPUT_STALL_CYCLES)\n",
+               [numFmt stringFromNumber:@(neOutStallPerIter)].UTF8String);
+        printf("  • Input Operand Stalls         : %s cycles/iter  (kANE_NE_INPUT_STALL_CYCLES)\n",
+               [numFmt stringFromNumber:@(neInStallPerIter)].UTF8String);
         printf("  • L2PE Compute Cycles          : %s cycles/iter  (kANE_L2PE_COMPUTE_CYCLES)\n",
                [numFmt stringFromNumber:@(l2pePerIter)].UTF8String);
         printf("  • Neural Engine Nominal Cycles : %s cycles/iter  (kANE_NE_NOMINAL_CYCLES)\n",
@@ -939,7 +947,8 @@ void decodeAndDumpPmuRegisters(BOOL isUnlocked) {
         }
 
         const char *subsystem = "Reserved / Internal";
-        if (i <= 4) subsystem = "On-Chip L2 SRAM Bus";
+        if (i <= 2) subsystem = "Activation Feeder / Data Processor";
+        else if (i <= 4) subsystem = "On-Chip L2 SRAM Bus";
         else if (i <= 6) subsystem = "Neural Engine (Convolution Engine)";
         else if (i <= 9) subsystem = "Pipeline Stall Detection";
         else if (i == 10) subsystem = "Neural Engine (Clock / Baseline)";
