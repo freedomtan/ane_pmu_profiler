@@ -11,11 +11,11 @@
 
 ## 1. Executive Summary
 
-Quantization is widely promoted as a universal optimization for neural networks on edge accelerators, promising $2\times$ to $4\times$ speedups by reducing weight and activation bitwidths. However, on spatial accelerators like the Apple Neural Engine (ANE), real-world performance gains diverge drastically based on quantization topology, tensor memory footprint, and microarchitectural datapath execution.
+Quantization is widely promoted as a universal optimization for neural networks on edge accelerators, promising 2× to 4× speedups by reducing weight and activation bitwidths. However, on spatial accelerators like the Apple Neural Engine (ANE), real-world performance gains diverge drastically based on quantization topology, tensor memory footprint, and microarchitectural datapath execution.
 
 This report presents a microarchitectural investigation of **nine production CoreML models** across three canonical vision paradigms:
 1. **MobileNetV2 (Alpha 1.0)**: Lightweight inverted residual CNN dominated by depthwise separable convolutions.
-2. **ResNet-50**: Deep residual convolutional network dominated by dense $1\times 1$ and $3\times 3$ convolutions with high channel counts.
+2. **ResNet-50**: Deep residual convolutional network dominated by dense 1×1 and 3×3 convolutions with high channel counts.
 3. **MobileViTv2 (Alpha 1.0)**: Hybrid Vision Transformer combining standard convolutions with separable self-attention blocks.
 
 For each architecture, three precision tiers were evaluated on physical Apple M4 silicon under identical thermal and frequency conditions:
@@ -90,9 +90,9 @@ The Apple Neural Engine is a **Slice-Based Multi-Engine Spatial Accelerator** (c
                           │     ┌────────────────────────────────────────────┐       │
                           │     │       MAC Array Execution Lane (416)       │       │
                           │     │                                            │       │
-                          │     │  ┌──────────────────┐ ┌─────────────────┐  │       │
-                          │     │  │ Main Mult (MULA) │ │ Supp Mult(MULB) │  │       │
-                          │     │  │   [FP16 / INT8]  │ │   [INT8 Only]   │  │       │
+                          │     │  ┌──────────────────┐ ┌──────────────────┐  │       │
+                          │     │  │ Main Mult (MULA) │ │ Supp Mult (MULB) │  │       │
+                          │     │  │   [FP16 / INT8]  │ │   [INT8 Only]    │  │       │
                           │     │  └────────┬─────────┘ └────────┬────────┘  │       │
                           │     └───────────┼────────────────────┼───────────┘       │
                           │                 ▼                    ▼                   │
@@ -115,26 +115,26 @@ Key silicon features disclosed in Apple patent **US20240329933A1** (*"Neural eng
    - **Supplemental Multiplier (MULB)**: Operates **exclusively in integer mode (INT8)**, directly accumulating into Accumulator B (414B) without shifter overhead. In FP16 mode, **MULB is clock-gated OFF**.
 2. **Peak Theoretical ALU Capacity**:
    - Each ANE core contains a 256-lane MAC tree with dual integer capability.
-   - **Arithmetic Conversion Principle**: Every Multiply-Accumulate (MAC) operation executes 2 arithmetic operations: 1 multiplication and 1 addition ($\text{Operations} = 2 \times \text{MACs}$).
+   - **Arithmetic Conversion Principle**: Every Multiply-Accumulate (MAC) operation executes 2 arithmetic operations: 1 multiplication and 1 addition (`Operations = 2 × MACs`).
    - **FP16 Precision Mode**:
-     - *Physical Execution*: Only Main Multipliers (`MULA`) are active ($256\text{ lanes/core}$); Supplemental Multipliers (`MULB`) are clock-gated OFF.
-     - *Per-Core Throughput*: $256\text{ MACs/cycle} = 512\text{ FLOPs/cycle}$.
-     - *Entire Chip Throughput ($16\text{ cores}$)*:
-       $$16\text{ cores} \times 256\text{ MULA} = 4,096\text{ MACs/cycle} = 8,192\text{ FLOPs/cycle}$$
-     - *Nominal Compute ($2.16\text{ GHz}$ `NEFreq`)*:
-       $$4,096\text{ MACs/cycle} \times 2.16\text{ GHz} = 8.85\text{ Tera-MACs/sec} \implies \mathbf{17.69\text{ TFLOPS (17.69 TOPS)}}$$
-     - *Peak Boost Compute ($\sim 2.32\text{ GHz}$)*:
-       $$4,096\text{ MACs/cycle} \times 2.32\text{ GHz} = 9.50\text{ Tera-MACs/sec} \implies \mathbf{19.01\text{ TFLOPS (19.01 TOPS)}}$$
+     - *Physical Execution*: Only Main Multipliers (`MULA`) are active (256 lanes/core); Supplemental Multipliers (`MULB`) are clock-gated OFF.
+     - *Per-Core Throughput*: 256 MACs/cycle = 512 FLOPs/cycle.
+     - *Entire Chip Throughput (16 cores)*:
+       `16 cores × 256 MULA = 4,096 MACs/cycle = 8,192 FLOPs/cycle`
+     - *Nominal Compute (2.16 GHz NEFreq)*:
+       `4,096 MACs/cycle × 2.16 GHz = 8.85 Tera-MACs/sec ➔ 17.69 TFLOPS (17.69 TOPS)`
+     - *Peak Boost Compute (~2.32 GHz)*:
+       `4,096 MACs/cycle × 2.32 GHz = 9.50 Tera-MACs/sec ➔ 19.01 TFLOPS (19.01 TOPS)`
    - **INT8 Precision Mode (W8A8)**:
      - *Physical Execution*: Both Main Multipliers (`MULA`, 256 lanes) and Supplemental Multipliers (`MULB`, 256 lanes) execute concurrently.
-     - *Per-Core Throughput*: $256 + 256 = 512\text{ INT8 MACs/cycle} = 1,024\text{ Ops/cycle}$.
-     - *Entire Chip Throughput ($16\text{ cores}$)*:
-       $$16\text{ cores} \times (256\text{ MULA} + 256\text{ MULB}) = 8,192\text{ MACs/cycle} = 16,384\text{ Ops/cycle}$$
-     - *Nominal Compute ($2.16\text{ GHz}$ `NEFreq`)*:
-       $$8,192\text{ MACs/cycle} \times 2.16\text{ GHz} = 17.69\text{ Tera-MACs/sec} \implies \mathbf{35.39\text{ TOPS}}$$
-     - *Peak Boost Compute ($\sim 2.32\text{ GHz}$)*:
-       $$8,192\text{ MACs/cycle} \times 2.32\text{ GHz} = 19.00\text{ Tera-MACs/sec} \implies \mathbf{38.01\text{ TOPS}}$$
-     - *Silicon Grounding*: This $\mathbf{38.01\text{ TOPS}}$ integer ceiling exactly matches Apple's official advertised specification of **38 TOPS** for the M4 Apple Neural Engine. Note that in previous flawed drafts, an erroneous double-multiplication mistakenly reported 71.44 TOPS by doubling operations twice.
+     - *Per-Core Throughput*: 256 + 256 = 512 INT8 MACs/cycle = 1,024 Ops/cycle.
+     - *Entire Chip Throughput (16 cores)*:
+       `16 cores × (256 MULA + 256 MULB) = 8,192 MACs/cycle = 16,384 Ops/cycle`
+     - *Nominal Compute (2.16 GHz NEFreq)*:
+       `8,192 MACs/cycle × 2.16 GHz = 17.69 Tera-MACs/sec ➔ 35.39 TOPS`
+     - *Peak Boost Compute (~2.32 GHz)*:
+       `8,192 MACs/cycle × 2.32 GHz = 19.00 Tera-MACs/sec ➔ 38.01 TOPS`
+     - *Silicon Grounding*: This **38.01 TOPS** integer ceiling exactly matches Apple's official advertised specification of **38 TOPS** for the M4 Apple Neural Engine. Note that in previous flawed drafts, an erroneous double-multiplication mistakenly reported 71.44 TOPS by doubling operations twice.
 
 ---
 
@@ -161,7 +161,7 @@ Weight-Only INT8 Mode (Hardware Execution Flow):
      - **MobileViTv2**: 173.36M vs 167.36M cycles (**103.6%** — a 3.6% cycle regression due to unpacking overhead).
 3. **Bandwidth Savings vs Execution Latency**:
    - Weight-Only quantization reduces disk storage and initial model load time from flash storage into DRAM.
-   - However, once tensors are in Unified Memory, total runtime DMA traffic drops by less than 5% (e.g. ResNet-50: 15.21 MB $\to$ 14.42 MB) because activation transfers dominate memory traffic during inference.
+   - However, once tensors are in Unified Memory, total runtime DMA traffic drops by less than 5% (e.g. ResNet-50: 15.21 MB → 14.42 MB) because activation transfers dominate memory traffic during inference.
 
 **Verdict**: Weight-Only quantization provides **0% algorithmic compute acceleration** on Apple Silicon Neural Engines.
 
@@ -199,9 +199,9 @@ Hardware register `[13]` (`kANE_NE_COMPUTE_CYCLES`) measures **only cycles where
 - When the pipeline encounters a stall—either waiting for input data from L2 SRAM/DRAM (`kANE_NE_INPUT_STALL_CYCLES` `[14]`) or backpressured by output writeback buffers (`kANE_NE_OUTPUT_STALL_CYCLES` `[15]`)—the compute array is **clock-gated OFF** to minimize dynamic power dissipation.
 - In memory-bound or spill-heavy layers, compute cycles represent less than 1% of total elapsed cycles, while output and input stall counters consume the remaining 99%.
 
-### 4.2 The L2 SRAM Capacity Threshold (~4–8 MB) and DRAM Spilling
+#### 4.2 The L2 SRAM Capacity Threshold (~4–8 MB) and DRAM Spilling
 
-The ANE incorporates an on-chip SRAM buffer (the **Data Buffer / L2 Cache 334**, estimated at $\sim 4-8\text{ MB}$ on M4):
+The ANE incorporates an on-chip SRAM buffer (the **Data Buffer / L2 Cache 334**, estimated at ~4–8 MB on M4):
 
 ```
 ┌────────────────────────────────────────────────────────────────────────────────────────┐
@@ -222,7 +222,7 @@ The ANE incorporates an on-chip SRAM buffer (the **Data Buffer / L2 Cache 334**,
 └────────────────────────────┴───────────────────────────────────────────────────────────┘
 ```
 
-In deep networks like ResNet-50 and MobileNetV2, early layers feature large spatial dimensions ($112\times 112, 56\times 56$), while later layers have smaller spatial dimensions but large channel depths ($14\times 14 \times 512, 7\times 7 \times 2048$). W8A8 quantization keeps working activation sets within L2 SRAM throughout much more of the network execution, eliminating DRAM round-trips.
+In deep networks like ResNet-50 and MobileNetV2, early layers feature large spatial dimensions (112×112, 56×56), while later layers have smaller spatial dimensions but large channel depths (14×14×512, 7×7×2048). W8A8 quantization keeps working activation sets within L2 SRAM throughout much more of the network execution, eliminating DRAM round-trips.
 
 ---
 
@@ -253,7 +253,7 @@ This metric produces catastrophic, unphysical artifacts:
    TOPS = (2 × Total MACs) / (Hardware Latency (Seconds) × 10^12)
    ```
    - Every MAC operation contributes 2 operations (1 multiply + 1 add).
-   - On M4 silicon, this metric is strictly bounded by **19.01 TFLOPS (FP16)** and **38.01 TOPS (INT8)** at peak boost clock ($\sim 2.32\text{ GHz}$).
+   - On M4 silicon, this metric is strictly bounded by **19.01 TFLOPS (FP16)** and **38.01 TOPS (INT8)** at peak boost clock (~2.32 GHz).
 
 ---
 
@@ -272,12 +272,12 @@ ResNet-50 Performance Summary:
 
 #### Microarchitectural Drivers:
 1. **Dual Multipliers in High-Channel Convolutions**:
-   - ResNet-50 is dominated by dense $1\times 1$ and $3\times 3$ convolutions with high channel depth ($C=64$ to $2048$).
-   - High channel depth allows the ANE compiler to fully saturate both `MULA` and `MULB` across all 16 Neural Engine cores, yielding a theoretical $2.0\times$ arithmetic speedup.
+   - ResNet-50 is dominated by dense 1×1 and 3×3 convolutions with high channel depth (C = 64 to 2048).
+   - High channel depth allows the ANE compiler to fully saturate both `MULA` and `MULB` across all 16 Neural Engine cores, yielding a theoretical 2.0× arithmetic speedup.
 2. **Memory Contention Relief**:
-   - DMA traffic drops by $46.3\%$ (from $15.21\text{ MB}$ to $8.17\text{ MB}$).
-   - This relieves contention across the **Data Processor Crossbar (US20230135306A1)**, reducing input stalls by $7.2\times$ ($22.9\text{M} \to 3.18\text{M}$ cycles).
-   - The combination of $2.0\times$ arithmetic parallelism and reduced memory arbitration pushes compute cycles down by **$2.52\times$**, resulting in a **$5.68\times$ energy reduction**.
+   - DMA traffic drops by 46.3% (from 15.21 MB to 8.17 MB).
+   - This relieves contention across the **Data Processor Crossbar (US20230135306A1)**, reducing input stalls by 7.2× (22.9M → 3.18M cycles).
+   - The combination of 2.0× arithmetic parallelism and reduced memory arbitration pushes compute cycles down by **2.52×**, resulting in a **5.68× energy reduction**.
 
 ---
 
@@ -306,12 +306,12 @@ W8A8:        ▏ 4,768 cycles (-99.98%!)
    - In W8A8, the 1-byte activation working set fits entirely within the on-chip **Data Buffer / L2 Cache (334)**.
    - Input stall cycles collapsed to just **4,768 cycles**, almost completely eliminating memory starvation bubbles.
 2. **2x Channel Density on SRAM Datapaths (Patent US11200490B2)**:
-   - MobileNetV2 is dominated by depthwise separable convolutions ($3\times 3$ depthwise + $1\times 1$ pointwise).
+   - MobileNetV2 is dominated by depthwise separable convolutions (3×3 depthwise + 1×1 pointwise).
    - Under Apple patent **US11200490B2** (*"Processing group convolution in neural network processor"*), the ANE features a dedicated Group Convolution datapath.
-   - In INT8 mode, fixed-width SRAM lines and crossbar buses carry **twice as many channel elements per cycle** (e.g. 64 INT8 values vs. 32 FP16 values per 512-bit bus line). Fed into dual integer multiplier lanes (MULA + MULB), this quadruples channel slice processing density, yielding an extraordinary **$3.90\times$ compute cycle reduction**.
+   - In INT8 mode, fixed-width SRAM lines and crossbar buses carry **twice as many channel elements per cycle** (e.g. 64 INT8 values vs. 32 FP16 values per 512-bit bus line). Fed into dual integer multiplier lanes (MULA + MULB), this quadruples channel slice processing density, yielding an extraordinary **3.90× compute cycle reduction**.
 3. **Planar Engine (PE / L2PE) Offload Collapse**:
-   - In FP16, batch normalization and activation functions frequently require multi-pass post-processing on the **Planar Engine (US12229657B2)**, consuming $2.87\text{M}$ L2PE cycles.
-   - In W8A8, static Conv + BN + ReLU sequences are fused into the MAC Post-Processor (428) requantization scale factor. Planar Engine cycles collapse to **147,752 cycles** (**$19.4\times$ reduction**).
+   - In FP16, batch normalization and activation functions frequently require multi-pass post-processing on the **Planar Engine (US12229657B2)**, consuming 2.87M L2PE cycles.
+   - In W8A8, static Conv + BN + ReLU sequences are fused into the MAC Post-Processor (428) requantization scale factor. Planar Engine cycles collapse to **147,752 cycles** (**19.4× reduction**).
 
 ---
 
@@ -338,7 +338,7 @@ MobileViTv2 Performance Summary:
      layer_3/4/5.unfolding_coreml_layer: non_traceable
      ```
    - Consequently, all multi-head separable self-attention blocks remained compiled as **100% FP16**.
-   - By Amdahl's Law, integer hardware acceleration applied only to the convolutional stem, downsampling inverted residuals, and FFN projections. The FP16 attention operations capped the overall compute cycle reduction at **$1.29\times$**.
+   - By Amdahl's Law, integer hardware acceleration applied only to the convolutional stem, downsampling inverted residuals, and FFN projections. The FP16 attention operations capped the overall compute cycle reduction at **1.29×**.
 2. **Persistent Planar Engine Workload**:
    - Self-attention reduction, context normalization, and softmax cannot leverage the MAC array's integer convolution engines and remain pinned to the **Planar Engine (340)** in FP16 precision.
    - MobileViTv2 executed **5,171,023 Planar Engine cycles** even in W8A8 mode (compared to just 148k cycles for MobileNetV2).
@@ -364,7 +364,7 @@ ResNet-50 FP16:     ████████████████████
 ResNet-50 W8A8:     ███████ 249k (-82.4%)
 ```
 
-In both ResNet-50 and MobileNetV2, **energy savings vastly outpace latency speedups** ($5.68\times$ energy reduction vs $1.72\times$ latency reduction for ResNet-50). This divergence stems from two physical factors:
+In both ResNet-50 and MobileNetV2, **energy savings vastly outpace latency speedups** (5.68× energy reduction vs 1.72× latency reduction for ResNet-50). This divergence stems from two physical factors:
 1. **Lower Dynamic Switching Power**: INT8 8-bit additions and multiplications require substantially less capacitive switching than 16-bit floating-point mantissa alignment and exponent normalization logic.
 2. **Elimination of DRAM Access Energy**: Unified Memory (LPDDR5X) transactions consume an order of magnitude more energy per bit than on-chip L2 SRAM accesses. Halving DMA traffic and eliminating DRAM round-trips drives disproportionate energy efficiency.
 
@@ -400,7 +400,7 @@ Based on empirical physical telemetry, developers targeting Apple Silicon Neural
    - Use quantization-aware training (QAT) via `coremltools.optimize.torch.quantization` with symmetric per-channel scales.
    - Ensure the compiler emits **MIL INT8 operations** (Native INT8) rather than simulated QDQ wrappers to engage the dual integer multiplier lanes (`MULB`).
 3. **Design for L2 SRAM Residency (~4–8 MB Working Set)**:
-   - For early convolutional layers, avoid excessively large feature maps ($H, W \ge 256$) with high channel depth that exceed on-chip L2 SRAM, as output backpressure stalls will consume up to 99% of execution cycles.
+   - For early convolutional layers, avoid excessively large feature maps (H, W ≥ 256) with high channel depth that exceed on-chip L2 SRAM, as output backpressure stalls will consume up to 99% of execution cycles.
    - If large spatial inputs are mandatory, quantize activations to INT8 immediately to cut memory footprint in half and avoid DRAM spilling.
 4. **Account for Amdahl's Law in Vision Transformers**:
-   - When quantizing hybrid architectures (like MobileViTv2), quantizing only convolutional layers while preserving self-attention in FP16 caps speedup at $\sim 1.45\times$. Full acceleration requires mixed-precision or specialized attention quantization targeting the Planar Engine.
+   - When quantizing hybrid architectures (like MobileViTv2), quantizing only convolutional layers while preserving self-attention in FP16 caps speedup at ~1.45×. Full acceleration requires mixed-precision or specialized attention quantization targeting the Planar Engine.
