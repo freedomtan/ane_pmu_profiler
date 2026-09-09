@@ -44,7 +44,8 @@ For each architecture, three precision tiers were evaluated on physical Apple M4
 │                          │ cycles. W8A8 halves footprint, cutting stalls by >2.1x.     │
 ├──────────────────────────┼─────────────────────────────────────────────────────────────┤
 │ Native INT8 vs QDQ       │ Simulated QDQ wrappers unroll in FP16 (MULB clock-gated off,│
-│                          │ 18.6 TOPS). Native INT8 hits 35.87 TOPS (94.4% of peak).    │
+│                          │ 18.60 TFLOPS, 97.8% of FP16 peak). Native INT8 hits         │
+│                          │ 35.87 TOPS (94.4% of Apple's 38 TOPS silicon ceiling).      │
 ├──────────────────────────┼─────────────────────────────────────────────────────────────┤
 │ Energy Efficiency        │ Dedicated Processing Engine energy (kANE_DPE_ENERGY) drops  │
 │                          │ by up to 5.68x (ResNet-50) and 4.58x (MobileNetV2).         │
@@ -113,9 +114,27 @@ Key silicon features disclosed in Apple patent **US20240329933A1** (*"Neural eng
    - **Main Multiplier (MULA)**: Operates in dual precision mode (FP16 or INT8). In FP16 mode, products pass through a barrel shifter (512) for exponent alignment before accumulation into Accumulator A (414A).
    - **Supplemental Multiplier (MULB)**: Operates **exclusively in integer mode (INT8)**, directly accumulating into Accumulator B (414B) without shifter overhead. In FP16 mode, **MULB is clock-gated OFF**.
 2. **Peak Theoretical ALU Capacity**:
-   - Each ANE core contains a 256-lane MAC tree.
-   - **FP16 Mode**: $16\text{ cores} \times 256\text{ MULA} = 4,096\text{ MACs/cycle}$. At M4's peak frequency of $\sim 2.18\text{ GHz}$, this delivers **17.86 TFLOPS (35.72 TOPS)**.
-   - **INT8 Mode**: $16\text{ cores} \times (256\text{ MULA} + 256\text{ MULB}) = 8,192\text{ MACs/cycle}$. At $\sim 2.18\text{ GHz}$, this delivers **35.72 Tera-MACs/sec (71.44 TOPS)**.
+   - Each ANE core contains a 256-lane MAC tree with dual integer capability.
+   - **Arithmetic Conversion Principle**: Every Multiply-Accumulate (MAC) operation executes 2 arithmetic operations: 1 multiplication and 1 addition ($\text{Operations} = 2 \times \text{MACs}$).
+   - **FP16 Precision Mode**:
+     - *Physical Execution*: Only Main Multipliers (`MULA`) are active ($256\text{ lanes/core}$); Supplemental Multipliers (`MULB`) are clock-gated OFF.
+     - *Per-Core Throughput*: $256\text{ MACs/cycle} = 512\text{ FLOPs/cycle}$.
+     - *Entire Chip Throughput ($16\text{ cores}$)*:
+       $$16\text{ cores} \times 256\text{ MULA} = 4,096\text{ MACs/cycle} = 8,192\text{ FLOPs/cycle}$$
+     - *Nominal Compute ($2.16\text{ GHz}$ `NEFreq`)*:
+       $$4,096\text{ MACs/cycle} \times 2.16\text{ GHz} = 8.85\text{ Tera-MACs/sec} \implies \mathbf{17.69\text{ TFLOPS (17.69 TOPS)}}$$
+     - *Peak Boost Compute ($\sim 2.32\text{ GHz}$)*:
+       $$4,096\text{ MACs/cycle} \times 2.32\text{ GHz} = 9.50\text{ Tera-MACs/sec} \implies \mathbf{19.01\text{ TFLOPS (19.01 TOPS)}}$$
+   - **INT8 Precision Mode (W8A8)**:
+     - *Physical Execution*: Both Main Multipliers (`MULA`, 256 lanes) and Supplemental Multipliers (`MULB`, 256 lanes) execute concurrently.
+     - *Per-Core Throughput*: $256 + 256 = 512\text{ INT8 MACs/cycle} = 1,024\text{ Ops/cycle}$.
+     - *Entire Chip Throughput ($16\text{ cores}$)*:
+       $$16\text{ cores} \times (256\text{ MULA} + 256\text{ MULB}) = 8,192\text{ MACs/cycle} = 16,384\text{ Ops/cycle}$$
+     - *Nominal Compute ($2.16\text{ GHz}$ `NEFreq`)*:
+       $$8,192\text{ MACs/cycle} \times 2.16\text{ GHz} = 17.69\text{ Tera-MACs/sec} \implies \mathbf{35.39\text{ TOPS}}$$
+     - *Peak Boost Compute ($\sim 2.32\text{ GHz}$)*:
+       $$8,192\text{ MACs/cycle} \times 2.32\text{ GHz} = 19.00\text{ Tera-MACs/sec} \implies \mathbf{38.01\text{ TOPS}}$$
+     - *Silicon Grounding*: This $\mathbf{38.01\text{ TOPS}}$ integer ceiling exactly matches Apple's official advertised specification of **38 TOPS** for the M4 Apple Neural Engine. Note that in previous flawed drafts, an erroneous double-multiplication mistakenly reported 71.44 TOPS by doubling operations twice.
 
 ---
 
@@ -157,13 +176,13 @@ Simulated QDQ Pattern:
   [Input FP16] ──► [Quantize to INT8] ──► [Dequantize to FP16] ──► [Conv FP16] ──► [Quantize to INT8]
   • Executes internal convolution on FP16 datapath (MULA only).
   • MULB is clock-gated OFF.
-  • Sustains 18.60 TOPS on M4; DMA volume: 35.3 MB.
+  • Sustains 18.60 TFLOPS on M4 (97.8% of 19.01 TFLOPS FP16 ceiling); DMA volume: 35.3 MB.
 
 Native INT8 Pattern:
   [Input INT8] ──────────────────────────────────────────────────► [Conv INT8 (MULA + MULB)] ──► [Output INT8]
   • Dual integer multipliers active simultaneously.
   • Zero intermediate dequantization.
-  • Sustains 35.87 TOPS on M4 (94.4% of 38 TOPS ceiling); DMA volume: 18.4 MB.
+  • Sustains 35.87 TOPS on M4 (94.4% of 38.01 TOPS INT8 ceiling); DMA volume: 18.4 MB.
 ```
 
 - In simulated QDQ models, the CoreML compiler (`ANEC`) unrolls the `dequantize` and `quantize` wrappers around FP16 operations. Because intermediate tensors are FP16, the hardware never engages the supplemental integer multiplier `MULB`.
@@ -233,6 +252,8 @@ This metric produces catastrophic, unphysical artifacts:
    ```
    TOPS = (2 × Total MACs) / (Hardware Latency (Seconds) × 10^12)
    ```
+   - Every MAC operation contributes 2 operations (1 multiply + 1 add).
+   - On M4 silicon, this metric is strictly bounded by **19.01 TFLOPS (FP16)** and **38.01 TOPS (INT8)** at peak boost clock ($\sim 2.32\text{ GHz}$).
 
 ---
 
